@@ -82,7 +82,15 @@
               services.xserver = {
                 enable = true;
                 desktopManager.xterm.enable = true;
-                displayManager.lightdm.enable = true;
+                displayManager.lightdm = {
+                  enable = true;
+                  greeter.enable = false;
+                };
+              };
+
+              services.displayManager.autoLogin = {
+                enable = true;
+                user = "human";
               };
 
               # Test user (the "human")

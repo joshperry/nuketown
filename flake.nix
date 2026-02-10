@@ -96,12 +96,22 @@
 
               security.sudo.wheelNeedsPassword = false;
 
+              # Enable SSH for remote access
+              services.openssh = {
+                enable = true;
+                settings.PermitRootLogin = "no";
+                settings.PasswordAuthentication = true;
+              };
+
               # Enable VM guest additions
               virtualisation.vmVariant = {
                 virtualisation = {
                   memorySize = 2048;
                   cores = 2;
                   diskSize = 8192;
+                  forwardPorts = [
+                    { from = "host"; host.port = 2222; guest.port = 22; }
+                  ];
                 };
               };
 

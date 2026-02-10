@@ -427,6 +427,9 @@ in
           enable = true;
           sessionVariables = {
             EDITOR = "vim";
+          } // lib.optionalAttrs agent.sudo.enable {
+            # Prepend home-manager bin to PATH so sudo shim is found first
+            PATH = "/etc/profiles/per-user/${name}/bin:$PATH";
           };
         };
 

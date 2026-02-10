@@ -54,7 +54,7 @@ sops.secrets."ada/ssh-key" = {
 };
 ```
 
-One secret, two expressions. The private key deploys to the agent. The public key authorizes her on target machines:
+The private key deploys to the agent. The public key authorizes her on target machines:
 
 ```nix
 # On any machine ada needs to reach

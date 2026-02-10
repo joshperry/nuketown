@@ -432,10 +432,10 @@ in
 
         programs.git = {
           enable = true;
-          userName = agent.git.name;
-          userEmail = agent.git.email;
           signing.signByDefault = agent.git.signing;
-          extraConfig = {
+          settings = {
+            user.name = agent.git.name;
+            user.email = agent.git.email;
             init.defaultBranch = "master";
             pull.rebase = true;
             safe.directory = "*";

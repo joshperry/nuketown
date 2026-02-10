@@ -8,3 +8,7 @@ result-*
 
 # direnv
 .direnv/
+
+# VM artifacts
+*.qcow2
+*.qcow2.tmp

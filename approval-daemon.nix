@@ -35,9 +35,9 @@ let
     set -euo pipefail
 
     SOCKET_PATH="${socketPath}"
-    mkdir -p "$(dirname "$SOCKET_PATH")"
-    chmod 755 "$(dirname "$SOCKET_PATH")"
-    rm -f "$SOCKET_PATH"
+    ${pkgs.coreutils}/bin/mkdir -p "$(${pkgs.coreutils}/bin/dirname "$SOCKET_PATH")"
+    ${pkgs.coreutils}/bin/chmod 755 "$(${pkgs.coreutils}/bin/dirname "$SOCKET_PATH")"
+    ${pkgs.coreutils}/bin/rm -f "$SOCKET_PATH"
 
     echo "Starting Nuketown sudo approval daemon on $SOCKET_PATH"
 

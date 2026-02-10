@@ -142,6 +142,49 @@ When `portal.enable = true`, the module generates two commands:
 
 This provides side-by-side collaboration: agent working in top pane, human in bottom pane, same directory.
 
+### Claude Code Integration
+
+When `claudeCode.enable = true` for an agent, the module auto-generates a `programs.claude-code` configuration in the agent's home-manager, including an agent definition that projects the nuketown declarative config into a Claude Code agent prompt.
+
+**Per-agent options** (`nuketown.agents.<name>.claudeCode`):
+- `enable`: Generate programs.claude-code config (default: false)
+- `package`: Claude Code package (default: `pkgs.unstable.claude-code`)
+- `settings`: Merged into `programs.claude-code.settings` (permissions, hooks, etc.)
+- `agentName`: Name for the generated agent file (default: `"<name>-<role>"`)
+- `extraPrompt`: Additional text appended to the auto-generated prompt
+- `extraAgents`: Additional hand-written agent definitions alongside the generated one
+
+**What gets generated:**
+The agent prompt includes sections derived from the nix config:
+- **Identity**: name, role, email, git signing status
+- **About You**: from `description` (if set)
+- **Environment**: home path, ephemeral nature, persisted directories
+- **Sudo**: approval workflow explanation (if `sudo.enable = true`)
+- **Hardware Access**: device list with subsystem/attrs (if `devices` is non-empty)
+- **Extra**: user-provided `extraPrompt` content
+
+The `identity.toml` file remains as a machine-readable complement for non-Claude tooling.
+
+Example:
+```nix
+nuketown.agents.ada = {
+  # ... standard nuketown config ...
+  claudeCode = {
+    enable = true;
+    settings.permissions = {
+      defaultMode = "allowEdits";
+      additionalDirectories = [ "/home/josh/dev" ];
+    };
+    extraPrompt = ''
+      ## NixOS Workflow
+      1. `nixos-rebuild build --flake . --show-trace`
+      2. `nvd diff /run/current-system result`
+      3. `sudo sh -c 'nix-env -p /nix/var/nix/profiles/system --set ./result && ./result/bin/switch-to-configuration switch'`
+    '';
+  };
+};
+```
+
 ### `approval-daemon.nix`
 
 Home-manager module that runs the approval daemon as a user service:

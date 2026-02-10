@@ -65,6 +65,24 @@
         }
       ];
 
+      claudeCode = {
+        enable = true;
+        settings.permissions = {
+          defaultMode = "allowEdits";
+          additionalDirectories = [ "/home/josh/dev" ];
+        };
+        # Extra context appended to the auto-generated agent prompt
+        extraPrompt = ''
+          ## NixOS Workflow
+
+          To build and apply system configuration changes:
+          1. `nixos-rebuild build --flake . --show-trace`
+          2. `nvd diff /run/current-system result`
+          3. `sudo sh -c 'nix-env -p /nix/var/nix/profiles/system --set ./result && ./result/bin/switch-to-configuration switch'`
+          4. `unlink result`
+        '';
+      };
+
       extraHomeConfig = {
         programs.neovim = {
           enable = true;
@@ -96,6 +114,9 @@
       secrets.sshKey = "vox/ssh-key";
 
       # No sudo — vox doesn't need it
+
+      # claudeCode.enable = true would auto-generate a "vox-research"
+      # agent definition. Off by default — enable per-agent as needed.
     };
   };
 

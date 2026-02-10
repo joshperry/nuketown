@@ -296,11 +296,149 @@ let
           description = "Pane split ratio (agent/human). '75/25' or '50/50'.";
         };
       };
+
+      claudeCode = {
+        enable = lib.mkOption {
+          type = lib.types.bool;
+          default = false;
+          description = ''
+            Auto-generate a programs.claude-code configuration for this agent.
+            Creates an agent definition from the nuketown config (role,
+            description, sudo, devices, persist) and injects it into the
+            agent's home-manager programs.claude-code.agents.
+          '';
+        };
+        package = lib.mkOption {
+          type = lib.types.nullOr lib.types.package;
+          default = pkgs.unstable.claude-code;
+          description = "Claude Code package for the agent. Set to null to skip package installation.";
+        };
+        settings = lib.mkOption {
+          type = lib.types.attrs;
+          default = {};
+          description = ''
+            Extra settings merged into programs.claude-code.settings.
+            Use this to configure permissions, hooks, etc.
+          '';
+          example = lib.literalExpression ''
+            {
+              permissions = {
+                defaultMode = "allowEdits";
+                additionalDirectories = [ "/home/josh/dev" ];
+              };
+            }
+          '';
+        };
+        agentName = lib.mkOption {
+          type = lib.types.str;
+          default = "${name}-${config.role}";
+          description = ''
+            Name for the auto-generated agent definition file.
+            Defaults to "<name>-<role>" (e.g. "ada-software").
+          '';
+        };
+        extraPrompt = lib.mkOption {
+          type = lib.types.lines;
+          default = "";
+          description = ''
+            Additional text appended to the generated agent prompt.
+            Use this for project-specific instructions, workflow notes, etc.
+          '';
+        };
+        extraAgents = lib.mkOption {
+          type = lib.types.attrsOf (lib.types.either lib.types.lines lib.types.path);
+          default = {};
+          description = ''
+            Additional hand-written agent definitions.
+            Merged alongside the auto-generated one into programs.claude-code.agents.
+          '';
+        };
+      };
     };
   };
 
   enabledAgents = lib.filterAttrs (_: a: a.enable) cfg.agents;
   sudoAgents = lib.filterAttrs (_: a: a.enable && a.sudo.enable) cfg.agents;
+  claudeCodeAgents = lib.filterAttrs (_: a: a.enable && a.claudeCode.enable) cfg.agents;
+
+  # ── Claude Code Agent Prompt Generator ─────────────────────────
+  # Builds a .md agent definition from the nuketown declarative config.
+  # The prompt tells Claude Code who it is, what it can do, and how
+  # its environment works — all derived from the same nix options that
+  # provision the actual system resources.
+
+  mkAgentPrompt = name: agent: let
+    hostname = config.networking.hostName;
+    capitalName = let
+      first = builtins.substring 0 1 agent.git.name;
+      rest = builtins.substring 1 (-1) agent.git.name;
+    in (lib.toUpper first) + rest;
+
+    # Device summary: "tty (0483:5740), usb (STM32 BOOTLOADER)"
+    deviceSummary = lib.concatMapStringsSep ", " (dev:
+      let
+        attrDesc = lib.concatStringsSep ", " (lib.mapAttrsToList (k: v: "${k}=${v}") dev.attrs);
+      in "${dev.subsystem} (${attrDesc})"
+    ) agent.devices;
+
+    persistList = lib.concatMapStringsSep ", " (d: "`${d}`") agent.persist;
+
+    sudoSection = lib.optionalString agent.sudo.enable ''
+
+      ## Sudo
+
+      Your sudo command routes through an approval daemon. The human operator
+      gets a popup dialog to approve or deny each invocation. You never have a
+      password — all privilege escalation requires interactive approval.
+
+      Use sudo sparingly and batch privileged operations when possible.
+    '';
+
+    deviceSection = lib.optionalString (agent.devices != []) ''
+
+      ## Hardware Access
+
+      You have ACL-based access to the following devices:
+      ${lib.concatMapStringsSep "\n" (dev:
+        let
+          attrDesc = lib.concatStringsSep ", " (lib.mapAttrsToList (k: v: "${k}=${v}") dev.attrs);
+        in "- **${dev.subsystem}**: ${attrDesc} (${dev.permission})"
+      ) agent.devices}
+    '';
+
+    extraSection = lib.optionalString (agent.claudeCode.extraPrompt != "") ''
+
+      ${agent.claudeCode.extraPrompt}
+    '';
+
+  in ''
+    ---
+    name: ${agent.claudeCode.agentName}
+    description: ${capitalName} — ${agent.role} agent on ${hostname}
+    tools: Read, Edit, Write, Bash, Glob, Grep
+    ---
+
+    You are ${capitalName}, a ${agent.role} agent running on the machine "${hostname}".
+    You operate as Unix user `${name}` (uid ${toString agent.uid}) with home directory ${cfg.agentsDir}/${name}.
+
+    ## Identity
+
+    - **Role**: ${agent.role}
+    - **Email**: ${agent.git.email}
+    - **Git**: Commits signed with GPG — your work is cryptographically attributed
+    ${lib.optionalString (agent.description != "") ''
+
+    ## About You
+
+    ${agent.description}
+    ''}
+    ## Environment
+
+    - **Home**: `${cfg.agentsDir}/${name}` — ephemeral, resets on every reboot
+    - **Persisted directories**: ${persistList}
+    - Everything else in your home is rebuilt from nix on boot
+    ${sudoSection}${deviceSection}${extraSection}
+  '';
 
   # ── Udev Rules ──────────────────────────────────────────────────
 
@@ -487,7 +625,8 @@ in
 
     # ── Home Manager ─────────────────────────────────────────────
     home-manager.users = lib.mapAttrs (name: agent:
-      lib.recursiveUpdate {
+      lib.foldl' lib.recursiveUpdate {} [
+      {
         home.username = name;
         home.homeDirectory = lib.mkForce "${cfg.agentsDir}/${name}";
         home.stateVersion = config.system.stateVersion;
@@ -534,7 +673,26 @@ in
           ${agent.description}
           """
         '';
-      } agent.extraHomeConfig
+      }
+
+      # ── Claude Code Integration ──────────────────────────────────
+      # Auto-generate programs.claude-code config from nuketown options.
+      # The agent definition is a projection of the declarative config:
+      # role, description, sudo, devices, persist all flow into the prompt.
+      (lib.optionalAttrs agent.claudeCode.enable {
+        programs.claude-code = {
+          enable = true;
+          package = agent.claudeCode.package;
+          settings = agent.claudeCode.settings;
+          agents = {
+            ${agent.claudeCode.agentName} = mkAgentPrompt name agent;
+          } // agent.claudeCode.extraAgents;
+        };
+      })
+
+      # User-provided extraHomeConfig merges last (can override anything above)
+      agent.extraHomeConfig
+      ]
     ) enabledAgents;
 
     # ── Filesystem ───────────────────────────────────────────────

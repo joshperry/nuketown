@@ -217,6 +217,11 @@
 
                 sudo.enable = true;
                 portal.enable = true;
+
+                claudeCode = {
+                  enable = true;
+                  settings.permissions.defaultMode = "allowEdits";
+                };
               };
             };
           };
@@ -319,6 +324,11 @@
                     attrs = { idVendor = "0483"; idProduct = "5740"; };
                   }
                 ];
+
+                claudeCode = {
+                  enable = true;
+                  settings.permissions.defaultMode = "allowEdits";
+                };
               };
             };
           };
@@ -374,6 +384,19 @@
             type = "app";
             program = toString vmManager;
           };
+        }
+      );
+
+      # ── Evaluation Checks ─────────────────────────────────────────
+      # Pure nix assertions against evaluated module config.
+      # No VM boot needed — instant feedback.
+      #
+      #   nix flake check           # run all checks
+      #   nix build .#checks.x86_64-linux.claude-code-enabled  # run one
+      checks = forAllSystems (system:
+        import ./checks.nix {
+          inherit nixpkgs nixpkgs-unstable home-manager impermanence sops-nix;
+          nuketownModule = ./module.nix;
         }
       );
 

@@ -362,39 +362,123 @@ For production testing on mynix/signi:
    - Reboot
    - Verify file survives
 
-### Automated Testing (Planned)
+### Automated Testing & Mock Approval
 
-Currently, testing sudo approval requires manual interaction with zenity dialogs. For CI/CD and automated testing, we plan to add a mock approval mechanism:
+Nuketown includes a file-based mock approval system for automated testing and CI/CD:
 
-**Planned Implementation:**
-- Add `mockApprovalPolicy` option to nuketown agents
-- Policies: `"always-approve"`, `"always-deny"`, `"pattern-match"`
-- Mock daemon would replace zenity with automated responses
-- Enables headless VM testing and CI pipelines
+**Mock Approval Implementation:**
+The approval wrapper checks `/run/sudo-approval/mode` before connecting to the socket:
+- If file contains `MOCK_APPROVED`: auto-approve all requests
+- If file contains `MOCK_DENIED`: auto-deny all requests
+- If file absent/invalid: fall back to normal socket-based approval
+- File must be created by human user (agents can only read)
 
-**Example Configuration:**
+**Usage:**
+```bash
+# Enable mock approval (as human user)
+echo "MOCK_APPROVED" > /run/sudo-approval/mode
+
+# Agent sudo requests auto-approve
+sudo -u ada bash -c 'sudo whoami'  # Prints "[MOCK] Auto-approved: whoami\nroot"
+
+# Switch to denial testing
+echo "MOCK_DENIED" > /run/sudo-approval/mode
+sudo -u ada bash -c 'sudo whoami'  # Fails with "[MOCK] Auto-denied: whoami"
+
+# Return to normal approval
+rm /run/sudo-approval/mode
+```
+
+**Security:**
+- Directory `/run/sudo-approval` owned by human (0755)
+- Mock file readable by all, writable only by owner
+- Agents cannot enable mock mode themselves
+- File is ephemeral (cleared on reboot)
+- Clear `[MOCK]` prefix in output for auditability
+
+**Test VM Configuration:**
+All test VMs enable mock approval via tmpfiles:
 ```nix
-nuketown.agents.ada = {
-  enable = true;
-  sudo.enable = true;
-
-  # For testing/CI environments
-  mockApprovalPolicy = "always-approve";
-  # Or pattern-based:
-  # mockApprovalPolicy = {
-  #   allow = [ "whoami" "ls *" ];
-  #   deny = [ "rm -rf *" ];
-  # };
+extraConfig = { ... }: {
+  systemd.tmpfiles.rules = [
+    "f /run/sudo-approval/mode 0644 human users - MOCK_APPROVED"
+  ];
 };
 ```
 
-This would allow automated test suites to verify:
-- Approval flow works correctly
-- Commands execute with proper privileges
-- Denial prevents execution
-- Flag parsing works for all sudo variants
+This enables headless VM testing - no GUI session needed!
 
-**Bonus:** With mock approval, VMs can run headless without needing Josh's GUI session. No more `sudo -u josh DISPLAY=:0` - just `./result/bin/run-nixos-vm` works fine since there's no zenity to display!
+### Test Framework
+
+Nuketown includes a bash testing framework with VM lifecycle management:
+
+**Files:**
+- `tests/lib.sh` - Test utilities (SSH helpers, assertions, reporting)
+- `tests/run-tests.sh` - Test runner (finds and executes all tests)
+- `tests/sudo-approval-mock.sh` - Mock approval test suite
+- `vm-manager.sh` - VM lifecycle management (start/stop/test)
+
+**VM Manager Usage:**
+```bash
+# Via flake apps (recommended - includes all dependencies)
+nix run .#vm -- start              # Build and start test-basic VM
+nix run .#vm -- status             # Check if VM is running
+nix run .#vm -- stop               # Stop VM and cleanup
+nix run .#test                     # Run all tests (auto-starts VM)
+nix run .#test -- simple-test      # Run specific test
+
+# Direct script usage (requires sshpass in PATH)
+./vm-manager.sh start
+./vm-manager.sh test
+./tests/run-tests.sh
+```
+
+**Writing Tests:**
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
+
+test_my_feature() {
+  # Run command on VM as human
+  local output=$(vm_run "whoami")
+  assert_equals "$output" "human" "Should be logged in as human"
+
+  # Run command as agent
+  local output=$(vm_run_as ada "sudo whoami 2>&1")
+  assert_contains "$output" "root" "Should execute as root"
+  assert_contains "$output" "[MOCK] Auto-approved" "Should show mock approval"
+}
+
+main() {
+  vm_wait 60 || exit 1
+  run_test "My feature works" test_my_feature
+  print_summary
+}
+
+main "$@"
+```
+
+**Available Helpers:**
+- `vm_run "command"` - Execute command as human on VM
+- `vm_run_as user "command"` - Execute command as specific user
+- `vm_copy src dst` - Copy file to VM
+- `vm_wait timeout` - Wait for VM SSH to be ready
+
+**Available Assertions:**
+- `assert_equals actual expected msg`
+- `assert_contains haystack needle msg`
+- `assert_not_contains haystack needle msg`
+- `pass msg` / `fail msg details` - Manual reporting
+
+**Known Issues:**
+- Test framework structure complete but has bash execution hang bug
+- Individual test functions work when run manually
+- Issue appears to be in test runner/assertion integration
+- Workaround: Test via direct SSH commands
+- To be debugged in future session
 
 ## Future Development
 

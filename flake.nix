@@ -78,21 +78,6 @@
                 fsType = "ext4";
               };
 
-              # Minimal graphical environment for testing approval dialogs
-              services.xserver = {
-                enable = true;
-                desktopManager.xterm.enable = true;
-                displayManager.lightdm = {
-                  enable = true;
-                  greeter.enable = false;
-                };
-              };
-
-              services.displayManager.autoLogin = {
-                enable = true;
-                user = "human";
-              };
-
               # Test user (the "human")
               users.mutableUsers = false;
               users.users.human = {
@@ -237,12 +222,13 @@
           };
 
           extraConfig = { ... }: {
-            # Enable approval daemon for human user
-            home-manager.users.human = {
-              imports = [ ./approval-daemon.nix ];
+            # Enable mock approval for automated testing
+            systemd.tmpfiles.rules = [
+              "f /run/sudo-approval/mode 0644 human users - MOCK_APPROVED"
+            ];
 
+            home-manager.users.human = {
               home.stateVersion = "25.11";
-              nuketown.approvalDaemon.enable = true;
             };
           };
         };
@@ -290,10 +276,13 @@
           };
 
           extraConfig = { ... }: {
+            # Enable mock approval for automated testing
+            systemd.tmpfiles.rules = [
+              "f /run/sudo-approval/mode 0644 human users - MOCK_APPROVED"
+            ];
+
             home-manager.users.human = {
-              imports = [ ./approval-daemon.nix ];
               home.stateVersion = "25.11";
-              nuketown.approvalDaemon.enable = true;
             };
           };
         };
@@ -335,14 +324,58 @@
           };
 
           extraConfig = { ... }: {
+            # Enable mock approval for automated testing
+            systemd.tmpfiles.rules = [
+              "f /run/sudo-approval/mode 0644 human users - MOCK_APPROVED"
+            ];
+
             home-manager.users.human = {
-              imports = [ ./approval-daemon.nix ];
               home.stateVersion = "25.11";
-              nuketown.approvalDaemon.enable = true;
             };
           };
         };
       };
+
+      # Testing apps
+      apps = forAllSystems (system:
+        let
+          pkgs = pkgsFor system;
+
+          # Package all test files together
+          testPackage = pkgs.runCommand "nuketown-tests" {} ''
+            mkdir -p $out/tests
+            cp ${./tests}/*.sh $out/tests/
+            chmod +x $out/tests/*.sh
+          '';
+
+          # Test runner with all dependencies in scope
+          testRunner = pkgs.writeScript "nuketown-test" ''
+            #!${pkgs.bash}/bin/bash
+            export PATH="${pkgs.lib.makeBinPath [ pkgs.sshpass pkgs.coreutils pkgs.findutils pkgs.gnused pkgs.gnugrep pkgs.openssh ]}:$PATH"
+            exec ${pkgs.bash}/bin/bash ${testPackage}/tests/run-tests.sh "$@"
+          '';
+
+          # VM manager with dependencies
+          vmManager = pkgs.writeScript "nuketown-vm" ''
+            #!${pkgs.bash}/bin/bash
+            export PATH="${pkgs.lib.makeBinPath [ pkgs.sshpass pkgs.coreutils pkgs.findutils pkgs.gnused pkgs.gnugrep pkgs.openssh pkgs.qemu ]}:$PATH"
+            export NUKETOWN_TEST_RUNNER="${testRunner}"
+            exec ${pkgs.bash}/bin/bash ${./vm-manager.sh} "$@"
+          '';
+        in {
+          # Run tests
+          test = {
+            type = "app";
+            program = toString testRunner;
+          };
+
+          # VM manager for testing
+          vm = {
+            type = "app";
+            program = toString vmManager;
+          };
+        }
+      );
 
       # Package outputs (empty for now, but useful for future additions)
       packages = forAllSystems (system:

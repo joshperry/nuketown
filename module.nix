@@ -15,6 +15,7 @@ let
     set -e
 
     SOCKET_PATH="${socketPath}"
+    MOCK_FILE="/run/sudo-approval/mode"
     REQUESTING_USER="''${SUDO_USER:-$(whoami)}"
     COMMAND="$*"
 
@@ -23,6 +24,24 @@ let
       exit 1
     fi
 
+    # Check for mock approval mode (for testing)
+    if [ -f "$MOCK_FILE" ]; then
+      MOCK_MODE=$(${pkgs.coreutils}/bin/cat "$MOCK_FILE" | ${pkgs.coreutils}/bin/tr -d '\n\r ')
+
+      if [ "$MOCK_MODE" = "MOCK_APPROVED" ]; then
+        echo "[MOCK] Auto-approved: $COMMAND" >&2
+        exec ${pkgs.sudo}/bin/sudo "$@"
+      elif [ "$MOCK_MODE" = "MOCK_DENIED" ]; then
+        echo "[MOCK] Auto-denied: $COMMAND" >&2
+        exit 1
+      else
+        echo "Error: Invalid mock mode in $MOCK_FILE (got: '$MOCK_MODE')" >&2
+        echo "Expected: MOCK_APPROVED or MOCK_DENIED" >&2
+        exit 1
+      fi
+    fi
+
+    # Normal approval flow via socket
     if [ ! -S "$SOCKET_PATH" ]; then
       echo "Error: Approval daemon is not running (socket not found at $SOCKET_PATH)" >&2
       exit 1

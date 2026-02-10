@@ -52,11 +52,20 @@ Agent home directories live on a btrfs subvolume (`@agents`) that rolls back to 
 
 ```
 nuketown/
-├── README.md              # User-facing documentation
-├── CLAUDE.md             # This file - developer guidance
-├── module.nix            # Main NixOS module (~560 lines)
+├── module.nix            # Main NixOS module (~770 lines)
 ├── approval-daemon.nix   # Home-manager module for sudo approval daemon
-└── example.nix           # Example configuration with two agents (ada, vox)
+├── checks.nix            # Pure nix evaluation checks (nix flake check)
+├── flake.nix             # Flake: test VMs, dev shell, apps, checks
+├── example.nix           # Example configuration with two agents (ada, vox)
+├── vm-manager.sh         # VM lifecycle management (start/stop/test)
+├── tests/
+│   ├── lib.sh            # Test utilities (SSH helpers, assertions)
+│   ├── run-tests.sh      # Test runner (discovers and runs all suites)
+│   ├── simple-test.sh    # Agent E2E tests (user, identity, git, prompt)
+│   └── sudo-approval-mock.sh  # Mock approval test suite
+├── README.md             # User-facing documentation
+├── CLAUDE.md             # This file - developer guidance
+└── docs/testing.md       # Testing session notes
 ```
 
 ## Module Architecture
@@ -142,9 +151,28 @@ When `portal.enable = true`, the module generates two commands:
 
 This provides side-by-side collaboration: agent working in top pane, human in bottom pane, same directory.
 
+### Shared Agent Identity
+
+Agent identity is defined once in the nix options and projected into multiple formats via `mkIdentity`:
+
+```
+nix options (role, description, git.*, devices, sudo, persist, ...)
+      │
+      ▼
+  mkIdentity ─── shared attrset ───┬── mkIdentityToml ──→ ~/.config/nuketown/identity.toml
+                                   │                       (machine-readable, runtime-agnostic)
+                                   │
+                                   └── mkAgentPrompt ───→ ~/.claude/agents/<name>.md
+                                                           (Claude Code specific)
+```
+
+**`identity.toml`** is the canonical identity file for any agent runtime — claude-code, a matrix bot, a custom shell agent, or anything that needs to know who it is. It contains: name, role, email, domain, home, uid, and description.
+
+**The Claude Code agent prompt** is one consumer of the same identity. It adds Claude-Code-specific sections (sudo workflow explanation, hardware access details, extra instructions) on top of the shared identity facts.
+
 ### Claude Code Integration
 
-When `claudeCode.enable = true` for an agent, the module auto-generates a `programs.claude-code` configuration in the agent's home-manager, including an agent definition that projects the nuketown declarative config into a Claude Code agent prompt.
+When `claudeCode.enable = true` for an agent, the module auto-generates a `programs.claude-code` configuration in the agent's home-manager, including an agent definition derived from `mkIdentity`.
 
 **Per-agent options** (`nuketown.agents.<name>.claudeCode`):
 - `enable`: Generate programs.claude-code config (default: false)
@@ -155,15 +183,13 @@ When `claudeCode.enable = true` for an agent, the module auto-generates a `progr
 - `extraAgents`: Additional hand-written agent definitions alongside the generated one
 
 **What gets generated:**
-The agent prompt includes sections derived from the nix config:
+The agent prompt includes sections derived from the shared identity:
 - **Identity**: name, role, email, git signing status
 - **About You**: from `description` (if set)
 - **Environment**: home path, ephemeral nature, persisted directories
 - **Sudo**: approval workflow explanation (if `sudo.enable = true`)
 - **Hardware Access**: device list with subsystem/attrs (if `devices` is non-empty)
 - **Extra**: user-provided `extraPrompt` content
-
-The `identity.toml` file remains as a machine-readable complement for non-Claude tooling.
 
 Example:
 ```nix
@@ -311,13 +337,13 @@ The module distinguishes between `tty` and `usb` subsystems because:
 - `usb` devices need `ATTR{...}` for direct attribute matching
 - USB devices that re-enumerate (serial→DFU) need `ACTION=="add|bind"`
 
-See `module.nix:255-272` for the rule generation logic.
+See the `mkUdevRules` definition in `module.nix` for the rule generation logic.
 
 ### Sudo Wrapper Architecture
-Three layers:
-1. **Agent's sudo shim** (home-manager package): Parses sudo flags and shadows `/run/wrappers/bin/sudo`
-2. **Approval wrapper** (system package): Connects to socket, waits for approval, executes `sudo` with approved flags
-3. **Approval daemon** (user service): Shows zenity dialog, returns APPROVED/DENIED
+Three layers across two files:
+1. **Agent's sudo shim** (`module.nix`, home-manager package): Parses sudo flags and shadows `/run/wrappers/bin/sudo`
+2. **Approval wrapper** (`module.nix`, system package): Connects to socket, waits for approval, executes `sudo` with approved flags
+3. **Approval daemon** (`approval-daemon.nix`, user service): Shows zenity dialog, returns APPROVED/DENIED
 
 **Flag Handling Flow:**
 When an agent runs `sudo -u josh ./command`:
@@ -457,7 +483,8 @@ Nuketown includes a bash testing framework with VM lifecycle management:
 
 **Files:**
 - `tests/lib.sh` - Test utilities (SSH helpers, assertions, reporting)
-- `tests/run-tests.sh` - Test runner (finds and executes all tests)
+- `tests/run-tests.sh` - Test runner (discovers and executes all test suites)
+- `tests/simple-test.sh` - Agent E2E tests (user, identity TOML, git, prompt, packages)
 - `tests/sudo-approval-mock.sh` - Mock approval test suite
 - `vm-manager.sh` - VM lifecycle management (start/stop/test)
 
@@ -512,21 +539,20 @@ main "$@"
 
 **Available Assertions:**
 - `assert_equals actual expected msg`
-- `assert_contains haystack needle msg`
+- `assert_contains haystack needle msg` (fixed-string match, not regex)
 - `assert_not_contains haystack needle msg`
 - `pass msg` / `fail msg details` - Manual reporting
 
-**Known Issues:**
-- Test framework structure complete but has bash execution hang bug
-- Individual test functions work when run manually
-- Issue appears to be in test runner/assertion integration
-- Workaround: Test via direct SSH commands
-- To be debugged in future session
+**Nix Evaluation Checks:**
+In addition to VM tests, `checks.nix` provides ~20 pure nix evaluation checks that validate module output without booting a VM:
+```bash
+nix flake check           # Run all checks (instant)
+nix build .#checks.x86_64-linux.module-identity-toml  # Run one check
+```
 
 ## Future Development
 
 Potential enhancements (not yet implemented):
-- Automated approval mocking for CI/CD (see above)
 - Matrix/chat integration for async communication
 - Git remote automation (automatic clone/push patterns)
 - Multi-machine support (agent on different host than human)
@@ -537,9 +563,10 @@ Potential enhancements (not yet implemented):
 ## Related Files
 
 **Nuketown (this repository):**
-- `module.nix`: Main nuketown module (~600 lines)
+- `module.nix`: Main nuketown module (~770 lines)
 - `approval-daemon.nix`: Home-manager module for sudo approval daemon
-- `flake.nix`: Test VM configurations
+- `checks.nix`: Pure nix evaluation checks (~350 lines)
+- `flake.nix`: Flake with test VMs, dev shell, apps, checks
 - `example.nix`: Example configuration with two agents
 
 **mynix (production reference):**

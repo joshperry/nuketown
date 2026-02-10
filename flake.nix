@@ -132,6 +132,11 @@
       nixosModules = {
         default = ./module.nix;
         nuketown = ./module.nix;
+        approvalDaemon = ./approval-daemon.nix;  # backwards compat alias
+      };
+
+      # Home-manager modules (for the human's config)
+      homeManagerModules = {
         approvalDaemon = ./approval-daemon.nix;
       };
 

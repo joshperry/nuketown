@@ -1,4 +1,4 @@
-{ config, lib, pkgs, ... }:
+{ config, options, lib, pkgs, ... }:
 
 let
   cfg = config.nuketown;
@@ -414,7 +414,7 @@ let
 
     - **Role**: ${id.role}
     - **Email**: ${id.email}
-    - **Git**: Commits signed with GPG — your work is cryptographically attributed
+    - **Git**: ${if id.signing then "Commits signed with GPG — your work is cryptographically attributed" else "Commits attributed by name and email"}
     ${lib.optionalString (id.description != "") ''
 
     ## About You
@@ -508,7 +508,7 @@ in
     };
   };
 
-  config = lib.mkIf cfg.enable {
+  config = lib.mkIf cfg.enable ({
 
     # Ensure humanUser is set when sudo agents exist
     assertions = [
@@ -680,6 +680,7 @@ in
       device = "/dev/disk/by-uuid/${cfg.btrfsDevice}";
       fsType = "btrfs";
       options = [ "subvol=@agents" "noatime" ];
+      neededForBoot = true;
     };
 
     boot.initrd.systemd.services.rollback-agents = lib.mkIf (cfg.btrfsDevice != null) {
@@ -707,7 +708,62 @@ in
       }) enabledAgents;
     };
 
-    # ── Secrets ──────────────────────────────────────────────────
+    # ── Udev ─────────────────────────────────────────────────────
+    services.udev.extraRules = lib.mkIf (mkUdevRules != "") mkUdevRules;
+
+    # ── Sudo Approval System ─────────────────────────────────────
+
+    # Allow agents to run the approval wrapper via sudo without a password.
+    # The wrapper itself gates execution behind the zenity approval dialog.
+    # Also allow the human to use machinectl for portal access.
+    security.sudo.extraRules =
+      lib.concatLists (lib.mapAttrsToList (name: agent:
+        lib.optional agent.sudo.enable {
+          users = [ name ];
+          runAs = "root:root";
+          commands =
+            if agent.sudo.commands == []
+            then [{
+              command = "/run/current-system/sw/bin/sudo-with-approval";
+              options = [ "NOPASSWD" "SETENV" ];
+            }]
+            else map (cmd: {
+              command = cmd;
+              options = [ "NOPASSWD" "SETENV" ];
+            }) agent.sudo.commands;
+        }
+      ) enabledAgents)
+      # machinectl NOPASSWD for the human when portals are enabled
+      ++ (let
+        portalAgents = lib.filterAttrs (_: a: a.enable && a.portal.enable) cfg.agents;
+      in lib.optionals (cfg.humanUser != null && portalAgents != {}) [{
+        users = [ cfg.humanUser ];
+        commands = [{
+          command = "/run/current-system/sw/bin/machinectl shell *";
+          options = [ "NOPASSWD" ];
+        }];
+      }]);
+
+    # Socket directory for the approval daemon
+    # Owned by the human user, group is 'users' (standard NixOS default group)
+    systemd.tmpfiles.rules = lib.mkIf (sudoAgents != {} && cfg.humanUser != null) [
+      "d /run/sudo-approval 0755 ${cfg.humanUser} users -"
+    ];
+
+    # The approval daemon runs as a user service under the human's
+    # session so it has access to the X11/Wayland display for zenity.
+    # Enabled via home-manager for the human user, or manually:
+    #   systemctl --user start sudo-approval-daemon
+    #
+    # Nuketown provides the service unit but doesn't know which user
+    # is "the human" — import nuketown.homeManagerModules.approvalDaemon
+    # in the human's home-manager config.
+
+  # ── Secrets ──────────────────────────────────────────────────
+  # Gate on whether sops-nix is actually loaded (options ? sops).
+  # Without sops-nix, the sops option path doesn't exist and any
+  # reference to it — even under mkIf false — triggers an error.
+  } // lib.optionalAttrs (options ? sops) {
     sops.secrets = lib.mkMerge (lib.mapAttrsToList (name: agent:
       let
         sopsFile = cfg.sopsFile;
@@ -730,44 +786,5 @@ in
         owner = name;
       }) agent.secrets.extraSecrets
     ) enabledAgents);
-
-    # ── Udev ─────────────────────────────────────────────────────
-    services.udev.extraRules = lib.mkIf (mkUdevRules != "") mkUdevRules;
-
-    # ── Sudo Approval System ─────────────────────────────────────
-
-    # Allow agents to run the approval wrapper via sudo without a password.
-    # The wrapper itself gates execution behind the zenity approval dialog.
-    security.sudo.extraRules = lib.concatLists (lib.mapAttrsToList (name: agent:
-      lib.optional agent.sudo.enable {
-        users = [ name ];
-        runAs = "root:root";
-        commands =
-          if agent.sudo.commands == []
-          then [{
-            command = "/run/current-system/sw/bin/sudo-with-approval";
-            options = [ "NOPASSWD" "SETENV" ];
-          }]
-          else map (cmd: {
-            command = cmd;
-            options = [ "NOPASSWD" "SETENV" ];
-          }) agent.sudo.commands;
-      }
-    ) enabledAgents);
-
-    # Socket directory for the approval daemon
-    # Owned by the human user, group is 'users' (standard NixOS default group)
-    systemd.tmpfiles.rules = lib.mkIf (sudoAgents != {} && cfg.humanUser != null) [
-      "d /run/sudo-approval 0755 ${cfg.humanUser} users -"
-    ];
-
-    # The approval daemon runs as a user service under the human's
-    # session so it has access to the X11/Wayland display for zenity.
-    # Enabled via home-manager for the human user, or manually:
-    #   systemctl --user start sudo-approval-daemon
-    #
-    # Nuketown provides the service unit but doesn't know which user
-    # is "the human" — import nuketown.homeManagerModules.approvalDaemon
-    # in the human's home-manager config.
-  };
+  });
 }

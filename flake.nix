@@ -109,6 +109,8 @@
                 enable = true;
                 settings.PermitRootLogin = "no";
                 settings.PasswordAuthentication = true;
+                # Limit pubkey attempts to avoid "too many authentication failures"
+                settings.PubkeyAuthentication = false;
               };
 
               # Enable VM guest additions
@@ -214,6 +216,7 @@
             nuketown = {
               enable = true;
               domain = "nuketown.test";
+              humanUser = "human";
 
               agents.ada = {
                 enable = true;
@@ -251,6 +254,7 @@
             nuketown = {
               enable = true;
               domain = "nuketown.test";
+              humanUser = "human";
 
               agents.ada = {
                 enable = true;
@@ -301,6 +305,7 @@
             nuketown = {
               enable = true;
               domain = "nuketown.test";
+              humanUser = "human";
 
               agents.ada = {
                 enable = true;

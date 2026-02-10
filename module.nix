@@ -36,7 +36,7 @@ let
 
     if [ "$RESPONSE" = "APPROVED" ]; then
       echo "Approved! Executing command..." >&2
-      exec "$@"
+      exec ${pkgs.sudo}/bin/sudo "$@"
     elif [ "$RESPONSE" = "DENIED" ]; then
       echo "Request denied." >&2
       exit 1
@@ -87,9 +87,42 @@ let
       EXEC:"${approvalHandler}"
   '';
 
-  # Shadow sudo binary for agents — redirects to the approval wrapper
+  # Shadow sudo binary for agents — parses sudo flags and redirects to approval wrapper
   sudoShim = pkgs.writeShellScriptBin "sudo" ''
-    exec /run/wrappers/bin/sudo sudo-with-approval "$@"
+    # Parse sudo flags
+    flags=()
+    while [[ $# -gt 0 ]]; do
+      case $1 in
+        -u|-g|-C|-D|-p|-r|-t|-T|-U)
+          # Flags that take an argument
+          flags+=("$1" "$2")
+          shift 2
+          ;;
+        -A|-b|-E|-H|-i|-k|-K|-l|-n|-P|-S|-s|-V|-v)
+          # Flags that don't take an argument
+          flags+=("$1")
+          shift
+          ;;
+        --)
+          # End of flags marker
+          shift
+          break
+          ;;
+        -*)
+          # Unknown flag, pass it through
+          flags+=("$1")
+          shift
+          ;;
+        *)
+          # First non-flag argument, this is the command
+          break
+          ;;
+      esac
+    done
+
+    # Now $@ contains only the command and its arguments
+    # Pass flags to sudo-with-approval, which will execute sudo with them after approval
+    exec /run/wrappers/bin/sudo sudo-with-approval "''${flags[@]}" "$@"
   '';
 
   # ── Agent Options ───────────────────────────────────────────────
@@ -317,9 +350,30 @@ in
       default = [ "~/dev" ];
       description = "Directories to search for projects (used by portal fzf)";
     };
+
+    humanUser = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        Username of the human who will run the approval daemon.
+        Required if any agents have sudo.enable = true.
+        This user must have the approval daemon enabled in their home-manager config.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
+
+    # Ensure humanUser is set when sudo agents exist
+    assertions = [
+      {
+        assertion = sudoAgents == {} || cfg.humanUser != null;
+        message = ''
+          nuketown.humanUser must be set when agents have sudo.enable = true.
+          Set nuketown.humanUser to the username who will run the approval daemon.
+        '';
+      }
+    ];
 
     # ── Portal Scripts ───────────────────────────────────────────
     # Per-agent tmux portal: fzf pick a project, open a window with
@@ -545,14 +599,10 @@ in
     ) enabledAgents);
 
     # Socket directory for the approval daemon
-    # Owned by the human user who runs the daemon service
-    # For now assumes uid 1000; TODO: make human user configurable
-    systemd.tmpfiles.rules = lib.mkIf (sudoAgents != {}) (
-      let humanUid = toString (config.users.users."human".uid or 1000);
-      in [
-        "d /run/sudo-approval 0755 ${humanUid} ${humanUid} -"
-      ]
-    );
+    # Owned by the human user, group is 'users' (standard NixOS default group)
+    systemd.tmpfiles.rules = lib.mkIf (sudoAgents != {} && cfg.humanUser != null) [
+      "d /run/sudo-approval 0755 ${cfg.humanUser} users -"
+    ];
 
     # The approval daemon runs as a user service under the human's
     # session so it has access to the X11/Wayland display for zenity.

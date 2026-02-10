@@ -9,6 +9,7 @@
     btrfsDevice = "38b243a0-c875-4758-8998-cc6c6a4c451e";
     sopsFile = ./secrets/agents.yaml;
     projectDirs = [ "~/dev" ];
+    humanUser = "josh";  # Required when agents have sudo.enable = true
 
     agents.ada = {
       enable = true;

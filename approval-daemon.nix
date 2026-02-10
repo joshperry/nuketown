@@ -35,7 +35,11 @@ let
     set -euo pipefail
 
     SOCKET_PATH="${socketPath}"
-    # Directory is created by systemd tmpfiles, just clean up old socket
+
+    # Directory is created by systemd tmpfiles at boot (module.nix)
+    # User service cannot create directories in /run, so we rely on tmpfiles
+
+    # Remove old socket if it exists
     ${pkgs.coreutils}/bin/rm -f "$SOCKET_PATH"
 
     echo "Starting Nuketown sudo approval daemon on $SOCKET_PATH"
@@ -63,6 +67,8 @@ in
         ExecStart = "${approvalDaemon}";
         Restart = "always";
         RestartSec = 5;
+        # Ensure DISPLAY is set for zenity to show GUI dialogs
+        Environment = "DISPLAY=:0";
       };
 
       Install = {

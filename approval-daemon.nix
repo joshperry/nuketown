@@ -8,12 +8,12 @@ let
   approvalHandler = pkgs.writeShellScript "sudo-approval-handler" ''
     read -r REQUEST
 
-    USER=$(echo "$REQUEST" | cut -d: -f1)
-    COMMAND=$(echo "$REQUEST" | cut -d: -f2-)
+    USER=$(echo "$REQUEST" | ${pkgs.coreutils}/bin/cut -d: -f1)
+    COMMAND=$(echo "$REQUEST" | ${pkgs.coreutils}/bin/cut -d: -f2-)
 
     # Escape HTML entities for zenity markup
-    USER_ESC=$(echo "$USER" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
-    COMMAND_ESC=$(echo "$COMMAND" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+    USER_ESC=$(echo "$USER" | ${pkgs.gnused}/bin/sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+    COMMAND_ESC=$(echo "$COMMAND" | ${pkgs.gnused}/bin/sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
 
     if ${pkgs.zenity}/bin/zenity \
         --question \

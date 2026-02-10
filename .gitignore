@@ -1,0 +1,10 @@
+# Secrets
+secrets/
+*.yaml.enc
+
+# Nix build artifacts
+result
+result-*
+
+# direnv
+.direnv/

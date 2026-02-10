@@ -542,9 +542,14 @@ in
     ) enabledAgents);
 
     # Socket directory for the approval daemon
-    systemd.tmpfiles.rules = lib.mkIf (sudoAgents != {}) [
-      "d /run/sudo-approval 0755 root root -"
-    ];
+    # Owned by the human user who runs the daemon service
+    # For now assumes uid 1000; TODO: make human user configurable
+    systemd.tmpfiles.rules = lib.mkIf (sudoAgents != {}) (
+      let humanUid = toString (config.users.users."human".uid or 1000);
+      in [
+        "d /run/sudo-approval 0755 ${humanUid} ${humanUid} -"
+      ]
+    );
 
     # The approval daemon runs as a user service under the human's
     # session so it has access to the X11/Wayland display for zenity.

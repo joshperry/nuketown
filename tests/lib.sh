@@ -78,38 +78,12 @@ vm_wait() {
 }
 
 # Assertions
-assert_success() {
-  local output="$1"
-  local message="${2:-Command should succeed}"
-
-  if [ $? -eq 0 ]; then
-    pass "$message"
-    return 0
-  else
-    fail "$message" "Exit code: $?"
-    return 1
-  fi
-}
-
-assert_failure() {
-  local exit_code=$?
-  local message="${1:-Command should fail}"
-
-  if [ $exit_code -ne 0 ]; then
-    pass "$message"
-    return 0
-  else
-    fail "$message" "Expected failure but succeeded"
-    return 1
-  fi
-}
-
 assert_contains() {
   local haystack="$1"
   local needle="$2"
   local message="${3:-Output should contain '$needle'}"
 
-  if echo "$haystack" | grep -q "$needle"; then
+  if echo "$haystack" | grep -qF "$needle"; then
     pass "$message"
     return 0
   else
@@ -123,7 +97,7 @@ assert_not_contains() {
   local needle="$2"
   local message="${3:-Output should not contain '$needle'}"
 
-  if ! echo "$haystack" | grep -q "$needle"; then
+  if ! echo "$haystack" | grep -qF "$needle"; then
     pass "$message"
     return 0
   else

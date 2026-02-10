@@ -3,11 +3,10 @@
 let
   cfg = config.nuketown;
 
-  # ── Sudo Approval Infrastructure ────────────────────────────────
-  # Three layers:
-  # 1. Per-agent: shadow sudo binary in home-manager that calls the wrapper
-  # 2. System: wrapper that connects to approval socket and execs on approval
-  # 3. User service: daemon under the human's X session showing zenity dialogs
+  # ── Sudo Approval Wrapper ───────────────────────────────────────
+  # The approval wrapper connects to the approval daemon's socket,
+  # sends the request, and execs the command on approval.
+  # The daemon itself runs as a user service (see approval-daemon.nix).
 
   socketPath = "/run/sudo-approval/socket";
 
@@ -63,47 +62,6 @@ let
       echo "Error communicating with approval daemon (got: '$RESPONSE')" >&2
       exit 1
     fi
-  '';
-
-  approvalHandler = pkgs.writeShellScript "sudo-approval-handler" ''
-    read -r REQUEST
-
-    USER=$(echo "$REQUEST" | cut -d: -f1)
-    COMMAND=$(echo "$REQUEST" | cut -d: -f2-)
-
-    # Escape HTML entities for zenity markup
-    USER_ESC=$(echo "$USER" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
-    COMMAND_ESC=$(echo "$COMMAND" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
-
-    if ${pkgs.zenity}/bin/zenity \
-        --question \
-        --title="Nuketown: Sudo Approval" \
-        --text="Agent <b>$USER_ESC</b> wants to run:\n\n<tt>$COMMAND_ESC</tt>\n\nApprove?" \
-        --ok-label="Approve" \
-        --cancel-label="Deny" \
-        --default-cancel \
-        --width=500 \
-        --timeout=60 \
-        2>/dev/null; then
-      echo "APPROVED"
-    else
-      echo "DENIED"
-    fi
-  '';
-
-  approvalDaemon = pkgs.writeShellScript "sudo-approval-daemon" ''
-    set -euo pipefail
-
-    SOCKET_PATH="${socketPath}"
-    mkdir -p "$(dirname "$SOCKET_PATH")"
-    chmod 755 "$(dirname "$SOCKET_PATH")"
-    rm -f "$SOCKET_PATH"
-
-    echo "Starting Nuketown sudo approval daemon on $SOCKET_PATH"
-
-    ${pkgs.socat}/bin/socat \
-      UNIX-LISTEN:"$SOCKET_PATH",fork,mode=666 \
-      EXEC:"${approvalHandler}"
   '';
 
   # Shadow sudo binary for agents — parses sudo flags and redirects to approval wrapper
@@ -361,29 +319,60 @@ let
   sudoAgents = lib.filterAttrs (_: a: a.enable && a.sudo.enable) cfg.agents;
   claudeCodeAgents = lib.filterAttrs (_: a: a.enable && a.claudeCode.enable) cfg.agents;
 
-  # ── Claude Code Agent Prompt Generator ─────────────────────────
-  # Builds a .md agent definition from the nuketown declarative config.
-  # The prompt tells Claude Code who it is, what it can do, and how
-  # its environment works — all derived from the same nix options that
-  # provision the actual system resources.
+  # ── Shared Agent Identity ──────────────────────────────────────
+  # Single source of truth for agent identity facts.
+  # Consumed by the TOML serializer (machine-readable, runtime-agnostic)
+  # and the Claude Code prompt generator (claude-code-specific).
 
-  mkAgentPrompt = name: agent: let
-    hostname = config.networking.hostName;
-    capitalName = let
+  mkIdentity = name: agent: {
+    name = agent.git.name;
+    displayName = let
       first = builtins.substring 0 1 agent.git.name;
       rest = builtins.substring 1 (-1) agent.git.name;
     in (lib.toUpper first) + rest;
+    username = name;
+    uid = agent.uid;
+    role = agent.role;
+    description = agent.description;
+    email = agent.git.email;
+    domain = cfg.domain;
+    signing = agent.git.signing;
+    hostname = config.networking.hostName;
+    home = "${cfg.agentsDir}/${name}";
+    persist = agent.persist;
+    sudo = agent.sudo.enable;
+    devices = agent.devices;
+  };
 
-    # Device summary: "tty (0483:5740), usb (STM32 BOOTLOADER)"
-    deviceSummary = lib.concatMapStringsSep ", " (dev:
-      let
-        attrDesc = lib.concatStringsSep ", " (lib.mapAttrsToList (k: v: "${k}=${v}") dev.attrs);
-      in "${dev.subsystem} (${attrDesc})"
-    ) agent.devices;
+  # ── Identity TOML Serializer ────────────────────────────────────
+  # Machine-readable identity file for any agent runtime.
+  # Lives at ~/.config/nuketown/identity.toml
 
-    persistList = lib.concatMapStringsSep ", " (d: "`${d}`") agent.persist;
+  mkIdentityToml = id: ''
+    name = "${id.name}"
+    role = "${id.role}"
+    email = "${id.email}"
+    domain = "${id.domain}"
+    home = "${id.home}"
+    uid = ${toString id.uid}
+  '' + lib.optionalString (id.description != "") ''
 
-    sudoSection = lib.optionalString agent.sudo.enable ''
+    [description]
+    text = """
+    ${id.description}
+    """
+  '';
+
+  # ── Claude Code Agent Prompt Generator ─────────────────────────
+  # Builds a .md agent definition from the shared identity.
+  # The prompt tells Claude Code who it is, what it can do, and how
+  # its environment works — all derived from the same identity that
+  # populates identity.toml.
+
+  mkAgentPrompt = id: agent: let
+    persistList = lib.concatMapStringsSep ", " (d: "`${d}`") id.persist;
+
+    sudoSection = lib.optionalString id.sudo ''
 
       ## Sudo
 
@@ -394,7 +383,7 @@ let
       Use sudo sparingly and batch privileged operations when possible.
     '';
 
-    deviceSection = lib.optionalString (agent.devices != []) ''
+    deviceSection = lib.optionalString (id.devices != []) ''
 
       ## Hardware Access
 
@@ -403,7 +392,7 @@ let
         let
           attrDesc = lib.concatStringsSep ", " (lib.mapAttrsToList (k: v: "${k}=${v}") dev.attrs);
         in "- **${dev.subsystem}**: ${attrDesc} (${dev.permission})"
-      ) agent.devices}
+      ) id.devices}
     '';
 
     extraSection = lib.optionalString (agent.claudeCode.extraPrompt != "") ''
@@ -414,27 +403,27 @@ let
   in ''
     ---
     name: ${agent.claudeCode.agentName}
-    description: ${capitalName} — ${agent.role} agent on ${hostname}
+    description: ${id.displayName} — ${id.role} agent on ${id.hostname}
     tools: Read, Edit, Write, Bash, Glob, Grep
     ---
 
-    You are ${capitalName}, a ${agent.role} agent running on the machine "${hostname}".
-    You operate as Unix user `${name}` (uid ${toString agent.uid}) with home directory ${cfg.agentsDir}/${name}.
+    You are ${id.displayName}, a ${id.role} agent running on the machine "${id.hostname}".
+    You operate as Unix user `${id.username}` (uid ${toString id.uid}) with home directory ${id.home}.
 
     ## Identity
 
-    - **Role**: ${agent.role}
-    - **Email**: ${agent.git.email}
+    - **Role**: ${id.role}
+    - **Email**: ${id.email}
     - **Git**: Commits signed with GPG — your work is cryptographically attributed
-    ${lib.optionalString (agent.description != "") ''
+    ${lib.optionalString (id.description != "") ''
 
     ## About You
 
-    ${agent.description}
+    ${id.description}
     ''}
     ## Environment
 
-    - **Home**: `${cfg.agentsDir}/${name}` — ephemeral, resets on every reboot
+    - **Home**: `${id.home}` — ephemeral, resets on every reboot
     - **Persisted directories**: ${persistList}
     - Everything else in your home is rebuilt from nix on boot
     ${sudoSection}${deviceSection}${extraSection}
@@ -663,29 +652,20 @@ in
           nix-direnv.enable = true;
         };
 
-        xdg.configFile."nuketown/identity.toml".text = ''
-          name = "${agent.git.name}"
-          role = "${agent.role}"
-          domain = "${cfg.domain}"
-
-          [description]
-          text = """
-          ${agent.description}
-          """
-        '';
+        xdg.configFile."nuketown/identity.toml".text =
+          mkIdentityToml (mkIdentity name agent);
       }
 
       # ── Claude Code Integration ──────────────────────────────────
-      # Auto-generate programs.claude-code config from nuketown options.
-      # The agent definition is a projection of the declarative config:
-      # role, description, sudo, devices, persist all flow into the prompt.
+      # Auto-generate programs.claude-code config from the shared identity.
+      # The agent prompt is one consumer of mkIdentity; identity.toml is another.
       (lib.optionalAttrs agent.claudeCode.enable {
         programs.claude-code = {
           enable = true;
           package = agent.claudeCode.package;
           settings = agent.claudeCode.settings;
           agents = {
-            ${agent.claudeCode.agentName} = mkAgentPrompt name agent;
+            ${agent.claudeCode.agentName} = mkAgentPrompt (mkIdentity name agent) agent;
           } // agent.claudeCode.extraAgents;
         };
       })

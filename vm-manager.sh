@@ -90,7 +90,8 @@ cmd_status() {
 }
 
 cmd_test() {
-  local test_name="${3:-}"
+  # After shift in dispatch, $1=vm-name (already captured globally), $2=test-name
+  local test_name="${2:-}"
 
   if ! is_running || ! can_ssh; then
     echo -e "${BLUE}Starting VM for testing...${NC}"
@@ -101,19 +102,12 @@ cmd_test() {
   local test_runner="${NUKETOWN_TEST_RUNNER:-./tests/run-tests.sh}"
 
   echo -e "${BLUE}Running tests...${NC}"
-  echo "DEBUG: test_runner=$test_runner" >&2
-  echo "DEBUG: About to execute test runner" >&2
 
   if [ -n "$test_name" ]; then
-    echo "DEBUG: Running with test_name: $test_name" >&2
     "$test_runner" "$test_name"
   else
-    echo "DEBUG: Running all tests" >&2
     "$test_runner"
   fi
-  local exit_code=$?
-  echo "DEBUG: Test runner exited with code: $exit_code" >&2
-  return $exit_code
 }
 
 cmd_restart() {

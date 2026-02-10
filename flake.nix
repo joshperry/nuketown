@@ -160,10 +160,22 @@
 
               # Documentation
               mdbook
+
+              # Helper scripts
+              (writeShellScriptBin "build-test-vm" ''
+                VM_NAME=''${1:-basic}
+                echo "Building test VM: $VM_NAME"
+                nix build ".#nixosConfigurations.test-$VM_NAME.config.system.build.vm"
+              '')
+              (writeShellScriptBin "run-test-vm" ''
+                VM_NAME=''${1:-basic}
+                echo "Building and running test VM: $VM_NAME"
+                nix run ".#nixosConfigurations.test-$VM_NAME.config.system.build.vm"
+              '')
             ];
 
             shellHook = ''
-              echo "🤘 Nuketown Development Shell"
+              echo "Nuketown Development Shell"
               echo ""
               echo "Available commands:"
               echo "  build-test-vm    - Build a test VM"
@@ -174,19 +186,6 @@
               echo "  - multi: Multiple agents with different roles"
               echo "  - hardware: Agent with hardware device access"
               echo ""
-            '';
-
-            # Helper scripts
-            BUILD_TEST_VM = pkgs.writeShellScriptBin "build-test-vm" ''
-              VM_NAME=''${1:-basic}
-              echo "Building test VM: $VM_NAME"
-              nix build ".#nixosConfigurations.test-$VM_NAME.config.system.build.vm" "$@"
-            '';
-
-            RUN_TEST_VM = pkgs.writeShellScriptBin "run-test-vm" ''
-              VM_NAME=''${1:-basic}
-              echo "Building and running test VM: $VM_NAME"
-              nix run ".#nixosConfigurations.test-$VM_NAME.config.system.build.vm"
             '';
           };
         }

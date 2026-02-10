@@ -212,7 +212,10 @@ in {
   in [
     (assertContains "toml has name" toml ''name = "ada"'')
     (assertContains "toml has role" toml ''role = "software"'')
+    (assertContains "toml has email" toml ''email = "ada@nuketown.test"'')
     (assertContains "toml has domain" toml ''domain = "nuketown.test"'')
+    (assertContains "toml has home" toml ''home = "/agents/ada"'')
+    (assertContains "toml has uid" toml "uid = 1100")
     (assertContains "toml has description" toml "Test software agent")
   ]);
 

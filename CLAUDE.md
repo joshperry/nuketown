@@ -550,31 +550,95 @@ nix flake check           # Run all checks (instant)
 nix build .#checks.x86_64-linux.module-identity-toml  # Run one check
 ```
 
-## Future Development
+## Roadmap
 
-Potential enhancements (not yet implemented):
-- Matrix/chat integration for async communication
-- Git remote automation (automatic clone/push patterns)
-- Multi-machine support (agent on different host than human)
-- Agent-to-agent coordination primitives
-- Declarative secret generation (not just deployment)
-- Home snapshot/restore for debugging
+### Near-term: Foundations
+
+These enable agents to work remotely and asynchronously. Each is useful standalone.
+
+**Chat/Matrix integration**
+Agents as persistent chat service clients — always available, device-independent,
+asynchronous. The README describes this as the primary interface. Unblocks cloud
+approval (chat-based sudo instead of zenity) and agent-to-agent coordination.
+Status: not started.
+
+**Cloud persistence shim** (Cloud Phase 1 — see `docs/cloud-spec.md`)
+Replace btrfs rollback + impermanence bind-mounts with rclone sync to object
+storage (S3/GCS). Reuses the existing `persist` option unchanged — agents declare
+what survives, the backend decides how. Can be used standalone: deploy to a
+Hetzner VM manually with nixos-anywhere, agent homes are ephemeral, persist dirs
+sync to a bucket. ~50-100 line NixOS module.
+Status: spec written.
+
+**Multi-machine support**
+Agent on a different host than human. Currently nuketown assumes one machine with
+both the human and agents. Cloud agents live on remote VMs. Requires thinking
+about: how the human reaches the agent (chat solves this), how secrets bootstrap
+on a new machine, and how the approval daemon works remotely.
+Status: not started.
+
+### Mid-term: Cloud product
+
+These compose the foundations into a deployable product.
+
+**Git remote automation**
+Declarative clone/push patterns — agents auto-clone repos on boot, push branches
+to configured remotes. Both local and cloud agents need this. Could be a simple
+home-manager module that generates systemd units from a list of repo URLs.
+Status: not started.
+
+**Cloud metadata module + CLI reconciler** (Cloud Phase 2)
+`nuketown.cloud` NixOS module options (provider, region, instanceType, disk,
+persistence backend). CLI tools: `nuketown deploy`, `nuketown status`,
+`nuketown destroy`. Reads the flake, diffs desired state vs actual cloud state,
+provisions/deploys/terminates. Hetzner backend first.
+Status: spec written.
+
+**Agent-to-agent coordination**
+Agents on different machines collaborating beyond git. Chat rooms are the first
+primitive. Shared git remotes are the second. No orchestration framework — just
+rooms and branches.
+Status: not started.
+
+### Long-term: Product and polish
+
+**Git-push auto-deploy** (Cloud Phase 3)
+Webhook receiver / GitHub App. Push to configured branch → automatic
+reconciliation. Deploy status notifications. Binary cache integration (build in
+CI, deploy from service).
+Status: spec written.
+
+**Declarative secret generation**
+Auto-generate SSH/GPG keys for new agents instead of requiring manual sops setup.
+Could use age keys derived from a machine key, or cloud KMS for cloud agents.
+Status: not started.
+
+**Hosted product** (Cloud Phase 4)
+Multi-tenant reconciliation service, web dashboard, chat-based approval for
+remote sudo, billing integration, additional cloud providers (AWS, GCE).
+The full "Vercel for AI agents" vision.
+Status: spec written. See `docs/cloud-spec.md` for details.
+
+**Home snapshot/restore**
+Save and restore agent home states for debugging. Useful for reproducing issues
+without losing the agent's current working state.
+Status: not started.
 
 ## Related Files
 
 **Nuketown (this repository):**
-- `module.nix`: Main nuketown module (~770 lines)
+- `module.nix`: Main NixOS module
 - `approval-daemon.nix`: Home-manager module for sudo approval daemon
-- `checks.nix`: Pure nix evaluation checks (~350 lines)
+- `checks.nix`: Pure nix evaluation checks
 - `flake.nix`: Flake with test VMs, dev shell, apps, checks
 - `example.nix`: Example configuration with two agents
+- `docs/cloud-spec.md`: Cloud deployment spec and design
 
-**mynix (production reference):**
-If using this in a real system, also reference:
-- `/home/josh/dev/mynix`: Real-world implementation with agents in production
+**mynix (production consumer):**
+mynix imports `nuketown.nixosModules.default` for production agent management on signi.
+- `/home/josh/dev/mynix`: Josh's NixOS configuration (imports nuketown)
 - `/home/josh/dev/mynix/CLAUDE.md`: Workflow for agents working with NixOS configs
-- `/home/josh/dev/mynix/modules/security/sudo-approval.nix`: Production sudo-approval module (template for nuketown)
-- `/home/josh/dev/mynix/users/ada/default.nix`: Production agent configuration (template for nuketown agents)
+- `/home/josh/dev/mynix/machines/signi/configuration.nix`: Production `nuketown.agents.ada` config
 
 ## Philosophy
 

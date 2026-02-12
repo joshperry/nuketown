@@ -183,6 +183,7 @@ let
   adaHM = fullCfg.home-manager.users.ada;
   adaCC = adaHM.programs.claude-code;
   adaPrompt = adaCC.agents.ada-software;
+  adaClaudeMd = adaHM.home.file.".claude/CLAUDE.md".text;
 
   voxHM = noCCCfg.home-manager.users.vox;
 
@@ -394,6 +395,15 @@ in {
   claude-code-agent-prompt-extra = mkCheck "claude-code-agent-prompt-extra" [
     (assertContains "custom section heading" adaPrompt "## Custom Section")
     (assertContains "custom instruction" adaPrompt "This is a custom instruction")
+  ];
+
+  # ── CLAUDE.md Identity File ───────────────────────────────────
+
+  claude-code-claude-md = mkCheck "claude-code-claude-md" [
+    (assertContains "identity in CLAUDE.md" adaClaudeMd "You are Ada")
+    (assertContains "role in CLAUDE.md" adaClaudeMd "**Role**: software")
+    (assertContains "environment in CLAUDE.md" adaClaudeMd "ephemeral")
+    (assertContains "no frontmatter in CLAUDE.md" adaClaudeMd "## Identity")
   ];
 
   # ── Disabled Claude Code ────────────────────────────────────────

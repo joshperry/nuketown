@@ -511,34 +511,45 @@ let
       ${agent.claudeCode.extraPrompt}
     '';
 
-  in ''
-    ---
-    name: ${agent.claudeCode.agentName}
-    description: ${id.displayName} — ${id.role} agent on ${id.hostname}
-    tools: Read, Edit, Write, Bash, Glob, Grep
-    ---
+    # Prompt body — shared between CLAUDE.md and agent definition
+    promptBody = ''
+      You are ${id.displayName}, a ${id.role} agent running on the machine "${id.hostname}".
+      You operate as Unix user `${id.username}` (uid ${toString id.uid}) with home directory ${id.home}.
 
-    You are ${id.displayName}, a ${id.role} agent running on the machine "${id.hostname}".
-    You operate as Unix user `${id.username}` (uid ${toString id.uid}) with home directory ${id.home}.
+      ## Identity
 
-    ## Identity
+      - **Role**: ${id.role}
+      - **Email**: ${id.email}
+      - **Git**: ${if id.signing then "Commits signed with GPG — your work is cryptographically attributed" else "Commits attributed by name and email"}
+      ${lib.optionalString (id.description != "") ''
 
-    - **Role**: ${id.role}
-    - **Email**: ${id.email}
-    - **Git**: ${if id.signing then "Commits signed with GPG — your work is cryptographically attributed" else "Commits attributed by name and email"}
-    ${lib.optionalString (id.description != "") ''
+      ## About You
 
-    ## About You
+      ${id.description}
+      ''}
+      ## Environment
 
-    ${id.description}
-    ''}
-    ## Environment
+      - **Home**: `${id.home}` — ephemeral, resets on every reboot
+      - **Persisted directories**: ${persistList}
+      - Everything else in your home is rebuilt from nix on boot
+      ${sudoSection}${deviceSection}${extraSection}
+    '';
 
-    - **Home**: `${id.home}` — ephemeral, resets on every reboot
-    - **Persisted directories**: ${persistList}
-    - Everything else in your home is rebuilt from nix on boot
-    ${sudoSection}${deviceSection}${extraSection}
-  '';
+  in {
+    # Full agent definition with YAML frontmatter (for .claude/agents/)
+    agentDef = ''
+      ---
+      name: ${agent.claudeCode.agentName}
+      description: ${id.displayName} — ${id.role} agent on ${id.hostname}
+      tools: Read, Edit, Write, Bash, Glob, Grep
+      ---
+
+      ${promptBody}
+    '';
+
+    # Identity prompt without frontmatter (for ~/.claude/CLAUDE.md)
+    inherit promptBody;
+  };
 
   # ── Udev Rules ──────────────────────────────────────────────────
 
@@ -780,16 +791,20 @@ in
       # ── Claude Code Integration ──────────────────────────────────
       # Auto-generate programs.claude-code config from the shared identity.
       # The agent prompt is one consumer of mkIdentity; identity.toml is another.
-      (lib.optionalAttrs agent.claudeCode.enable {
+      (lib.optionalAttrs agent.claudeCode.enable (let
+        prompt = mkAgentPrompt (mkIdentity name agent) agent;
+      in {
+        home.file.".claude/CLAUDE.md".text = prompt.promptBody;
+
         programs.claude-code = {
           enable = true;
           package = agent.claudeCode.package;
           settings = agent.claudeCode.settings;
           agents = {
-            ${agent.claudeCode.agentName} = mkAgentPrompt (mkIdentity name agent) agent;
+            ${agent.claudeCode.agentName} = prompt.agentDef;
           } // agent.claudeCode.extraAgents;
         };
-      })
+      }))
 
       # User-provided extraHomeConfig merges last (can override anything above)
       agent.extraHomeConfig

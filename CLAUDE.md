@@ -552,49 +552,58 @@ nix build .#checks.x86_64-linux.module-identity-toml  # Run one check
 
 ## Roadmap
 
+The cloud deployment story uses k8s + ArgoCD + nix-snapshotter instead of
+raw VMs. See `docs/cloud-spec.md` for the full spec.
+
+The work splits across three repos:
+
+| Repo | Role | Scope |
+|------|------|-------|
+| **nuketown** (this repo) | Declares | Module options, `toKubeManifests`, identity |
+| **nuketown-deploy** (new) | Reconciles | ArgoCD plugin, scaling controller, cluster docs |
+| **nuketown-chat** (new) | Interfaces | Matrix bot, chat-based approval, agent coordination |
+
 ### Near-term: Foundations
 
 These enable agents to work remotely and asynchronously. Each is useful standalone.
 
-**Chat/Matrix integration**
+**Chat/Matrix integration** → *nuketown-chat*
 Agents as persistent chat service clients — always available, device-independent,
 asynchronous. The README describes this as the primary interface. Unblocks cloud
-approval (chat-based sudo instead of zenity) and agent-to-agent coordination.
+approval (chat-based sudo instead of zenity) and resource scaling approval.
 Status: not started.
 
-**Cloud persistence shim** (Cloud Phase 1 — see `docs/cloud-spec.md`)
-Replace btrfs rollback + impermanence bind-mounts with rclone sync to object
-storage (S3/GCS). Reuses the existing `persist` option unchanged — agents declare
-what survives, the backend decides how. Can be used standalone: deploy to a
-Hetzner VM manually with nixos-anywhere, agent homes are ephemeral, persist dirs
-sync to a bucket. ~50-100 line NixOS module.
-Status: spec written.
+**Cloud module options + nix-to-YAML** (Cloud Phase 1) → *nuketown*
+`nuketown.cloud` options (enable, resources, scaling, identity) and
+`nuketown.lib.toKubeManifests` — a pure nix function that translates agent config
+into k8s manifests (Deployment, PVC, ServiceAccount, ResourceQuota). Persistence
+maps directly: `persist` dirs become PVCs. Works with `kubectl apply` manually.
+Test: deploy ada to local k3s.
+Status: spec written. See `docs/cloud-spec.md`.
 
 **Multi-machine support**
-Agent on a different host than human. Currently nuketown assumes one machine with
-both the human and agents. Cloud agents live on remote VMs. Requires thinking
-about: how the human reaches the agent (chat solves this), how secrets bootstrap
-on a new machine, and how the approval daemon works remotely.
+Agent on a different host than human. K8s solves scheduling, but the human-agent
+interaction model still needs work: chat-based approval replaces zenity, secrets
+bootstrap via workload identity + KMS instead of host keys.
 Status: not started.
 
 ### Mid-term: Cloud product
 
 These compose the foundations into a deployable product.
 
-**Git remote automation**
+**Git remote automation** → *nuketown*
 Declarative clone/push patterns — agents auto-clone repos on boot, push branches
 to configured remotes. Both local and cloud agents need this. Could be a simple
 home-manager module that generates systemd units from a list of repo URLs.
 Status: not started.
 
-**Cloud metadata module + CLI reconciler** (Cloud Phase 2)
-`nuketown.cloud` NixOS module options (provider, region, instanceType, disk,
-persistence backend). CLI tools: `nuketown deploy`, `nuketown status`,
-`nuketown destroy`. Reads the flake, diffs desired state vs actual cloud state,
-provisions/deploys/terminates. Hetzner backend first.
-Status: spec written.
+**ArgoCD integration** (Cloud Phase 2) → *nuketown-deploy*
+Config management plugin that wraps `toKubeManifests`. ArgoCD Application
+manifest for a nuketown repo. Push-to-deploy working end-to-end. ArgoCD
+handles all reconciliation — watch, diff, sync, rollback, dashboard.
+Status: spec written. See `docs/cloud-spec.md`.
 
-**Agent-to-agent coordination**
+**Agent-to-agent coordination** → *nuketown-chat*
 Agents on different machines collaborating beyond git. Chat rooms are the first
 primitive. Shared git remotes are the second. No orchestration framework — just
 rooms and branches.
@@ -602,24 +611,25 @@ Status: not started.
 
 ### Long-term: Product and polish
 
-**Git-push auto-deploy** (Cloud Phase 3)
-Webhook receiver / GitHub App. Push to configured branch → automatic
-reconciliation. Deploy status notifications. Binary cache integration (build in
-CI, deploy from service).
+**Orchestration UX** (Cloud Phase 3) → *nuketown-deploy*
+Resource scaling controller — agents request more resources via chat, human
+approves, pod reschedules. Idle timeout auto-downscaling. Node pool migration
+(standard → build → GPU). The "moving to my desktop" experience.
 Status: spec written.
 
-**Declarative secret generation**
+**Declarative secret generation** → *nuketown*
 Auto-generate SSH/GPG keys for new agents instead of requiring manual sops setup.
-Could use age keys derived from a machine key, or cloud KMS for cloud agents.
+Cloud agents use workload identity + KMS for secret decryption — no key material
+on disk.
 Status: not started.
 
-**Hosted product** (Cloud Phase 4)
-Multi-tenant reconciliation service, web dashboard, chat-based approval for
-remote sudo, billing integration, additional cloud providers (AWS, GCE).
-The full "Vercel for AI agents" vision.
+**Production hardening** (Cloud Phase 4) → *nuketown-deploy*
+Workload identity setup automation (GKE, EKS). Network policies (egress-only
+default). Cost controls (ResourceQuota, LimitRange, budget alerts). Multi-tenant
+cluster support. Spot/preemptible scheduling for idle agents.
 Status: spec written. See `docs/cloud-spec.md` for details.
 
-**Home snapshot/restore**
+**Home snapshot/restore** → *nuketown*
 Save and restore agent home states for debugging. Useful for reproducing issues
 without losing the agent's current working state.
 Status: not started.

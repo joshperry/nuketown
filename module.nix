@@ -8,13 +8,13 @@ let
   # sends the request, and execs the command on approval.
   # The daemon itself runs as a user service (see approval-daemon.nix).
 
-  socketPath = "/run/sudo-approval/socket";
+  socketPath = "/run/nuketown-broker/socket";
 
   approvalWrapper = pkgs.writeShellScriptBin "sudo-with-approval" ''
     set -e
 
     SOCKET_PATH="${socketPath}"
-    MOCK_FILE="/run/sudo-approval/mode"
+    MOCK_FILE="/run/nuketown-broker/mode"
     REQUESTING_USER="''${SUDO_USER:-$(whoami)}"
     COMMAND="$*"
 
@@ -50,7 +50,7 @@ let
 
     # Send request to daemon and wait for response
     # Username:command format — usernames can't contain colons on Unix
-    RESPONSE=$(printf "%s\n" "$REQUESTING_USER:$COMMAND" | ${pkgs.socat}/bin/socat STDIO,ignoreeof UNIX-CONNECT:"$SOCKET_PATH" || echo "ERROR")
+    RESPONSE=$(printf "%s\n\n" "$REQUESTING_USER:$COMMAND" | ${pkgs.socat}/bin/socat STDIO,ignoreeof UNIX-CONNECT:"$SOCKET_PATH" || echo "ERROR")
 
     if [ "$RESPONSE" = "APPROVED" ]; then
       echo "Approved! Executing command..." >&2
@@ -62,6 +62,117 @@ let
       echo "Error communicating with approval daemon (got: '$RESPONSE')" >&2
       exit 1
     fi
+  '';
+
+  # ── Sops Helpers ───────────────────────────────────────────────
+  # sops-unlock: sends a DECRYPT request to the broker socket
+  sopsUnlock = pkgs.writeShellScriptBin "sops-unlock" ''
+    set -e
+
+    SOCKET_PATH="${socketPath}"
+
+    if [ ! -S "$SOCKET_PATH" ]; then
+      echo "Error: Broker daemon is not running (socket not found at $SOCKET_PATH)" >&2
+      exit 1
+    fi
+
+    echo "Requesting YubiKey decrypt via broker..." >&2
+
+    RESPONSE=$(printf "%s\n\n" "DECRYPT:/etc/sops-age-key.gpg:/run/sops-age/keys.txt" | \
+      ${pkgs.socat}/bin/socat STDIO,ignoreeof UNIX-CONNECT:"$SOCKET_PATH" || echo "ERROR")
+
+    if [ "$RESPONSE" = "DECRYPTED" ]; then
+      echo "Age key unlocked." >&2
+    elif [ "$RESPONSE" = "DENIED" ]; then
+      echo "Decrypt denied or failed." >&2
+      exit 1
+    else
+      echo "Error communicating with broker (got: '$RESPONSE')" >&2
+      exit 1
+    fi
+  '';
+
+  # sops-lock: removes the decrypted age key
+  sopsLock = pkgs.writeShellScriptBin "sops-lock" ''
+    rm -f /run/sops-age/keys.txt
+    echo "Age key locked." >&2
+  '';
+
+  # sudoex: extended sudo with composable requirements
+  # Sends all requirements + SUDO to broker on one connection.
+  # Usage: sudoex [--decrypt src:dest] [--] <command...>
+  sudoex = pkgs.writeShellScriptBin "sudoex" ''
+    set -e
+
+    SOCKET_PATH="${socketPath}"
+    REQUESTING_USER="$(whoami)"
+    REQUIREMENTS=""
+
+    # Parse flags into requirements
+    while [[ $# -gt 0 ]]; do
+      case $1 in
+        --decrypt)
+          REQUIREMENTS="''${REQUIREMENTS}DECRYPT:$2"$'\n'
+          shift 2
+          ;;
+        --)
+          shift
+          break
+          ;;
+        *)
+          break
+          ;;
+      esac
+    done
+
+    COMMAND="$*"
+
+    if [ -z "$COMMAND" ]; then
+      echo "Usage: sudoex [--decrypt src:dest] [--] <command...>" >&2
+      exit 1
+    fi
+
+    if [ ! -S "$SOCKET_PATH" ]; then
+      echo "Error: Broker daemon is not running (socket not found at $SOCKET_PATH)" >&2
+      exit 1
+    fi
+
+    # Send all requirements + SUDO on one connection
+    RESPONSE=$(printf "%sSUDO:%s:%s\n\n" "$REQUIREMENTS" "$REQUESTING_USER" "$COMMAND" | \
+      ${pkgs.socat}/bin/socat STDIO,ignoreeof UNIX-CONNECT:"$SOCKET_PATH" || echo "ERROR")
+
+    if [ "$RESPONSE" = "APPROVED" ]; then
+      echo "Approved. Executing..." >&2
+      /run/wrappers/bin/sudo /run/current-system/sw/bin/sudoex-run "$@"
+      RC=$?
+      exit $RC
+    elif [ "$RESPONSE" = "DENIED" ]; then
+      echo "Denied." >&2
+      exit 1
+    else
+      echo "Error communicating with broker (got: '$RESPONSE')" >&2
+      exit 1
+    fi
+  '';
+
+  # sudoex-run: privilege escalation target for sudoex. Just execs its args.
+  sudoexRun = pkgs.writeShellScriptBin "sudoex-run" ''
+    exec "$@"
+  '';
+
+  # nuketown-switch: convenience wrapper for switch-with-secrets
+  nuketownSwitch = pkgs.writeShellScriptBin "nuketown-switch" ''
+    set -e
+
+    if [ $# -eq 0 ]; then
+      set -- sh -c 'nix-env -p /nix/var/nix/profiles/system --set ./result && ./result/bin/switch-to-configuration switch'
+    fi
+
+    sudoex --decrypt "/etc/sops-age-key.gpg:/run/sops-age/keys.txt" -- "$@"
+    RC=$?
+    rm -f /run/sops-age/keys.txt
+    echo "Age key locked." >&2
+    exit $RC
   '';
 
   # Shadow sudo binary for agents — parses sudo flags and redirects to approval wrapper
@@ -526,7 +637,7 @@ in
     # the agent in the top pane and your shell in the bottom.
 
     environment.systemPackages =
-      (lib.optional (sudoAgents != {}) approvalWrapper)
+      (lib.optionals (sudoAgents != {}) [ approvalWrapper sudoexRun ])
       ++ lib.concatLists (lib.mapAttrsToList (name: agent:
         lib.optional agent.portal.enable (
           let
@@ -599,18 +710,28 @@ in
       ));
 
     # ── Users ────────────────────────────────────────────────────
-    users.users = lib.mapAttrs (name: agent: {
-      uid = agent.uid;
-      group = name;
-      isNormalUser = true;
-      home = "${cfg.agentsDir}/${name}";
-      shell = pkgs.bash;
-      extraGroups = [];
-    }) enabledAgents;
+    users.users = lib.mkMerge [
+      (lib.mapAttrs (name: agent: {
+        uid = agent.uid;
+        group = name;
+        isNormalUser = true;
+        home = "${cfg.agentsDir}/${name}";
+        shell = pkgs.bash;
+        extraGroups = lib.optional agent.sudo.enable "nuketown-broker";
+      }) enabledAgents)
+      # Human user needs nuketown-secrets to write decrypted keys via broker
+      (lib.mkIf (sudoAgents != {} && cfg.humanUser != null) {
+        ${cfg.humanUser}.extraGroups = [ "nuketown-secrets" ];
+      })
+    ];
 
     users.groups = lib.mapAttrs (name: agent: {
       gid = agent.uid;
-    }) enabledAgents;
+    }) enabledAgents
+    // lib.optionalAttrs (sudoAgents != {}) {
+      nuketown-broker = {};
+      nuketown-secrets = {};
+    };
 
     # ── Home Manager ─────────────────────────────────────────────
     home-manager.users = lib.mapAttrs (name: agent:
@@ -622,7 +743,7 @@ in
 
         home.packages = cfg.basePackages ++ agent.packages
           # Shadow sudo with approval shim for agents with sudo enabled
-          ++ lib.optional agent.sudo.enable sudoShim;
+          ++ lib.optionals agent.sudo.enable [ sudoShim sudoex sopsUnlock sopsLock nuketownSwitch ];
 
         programs.bash = {
           enable = true;
@@ -723,10 +844,16 @@ in
           runAs = "root:root";
           commands =
             if agent.sudo.commands == []
-            then [{
-              command = "/run/current-system/sw/bin/sudo-with-approval";
-              options = [ "NOPASSWD" "SETENV" ];
-            }]
+            then [
+              {
+                command = "/run/current-system/sw/bin/sudo-with-approval";
+                options = [ "NOPASSWD" "SETENV" ];
+              }
+              {
+                command = "/run/current-system/sw/bin/sudoex-run";
+                options = [ "NOPASSWD" "SETENV" ];
+              }
+            ]
             else map (cmd: {
               command = cmd;
               options = [ "NOPASSWD" "SETENV" ];
@@ -744,16 +871,17 @@ in
         }];
       }]);
 
-    # Socket directory for the approval daemon
-    # Owned by the human user, group is 'users' (standard NixOS default group)
+    # Socket directory for the broker
+    # Only the human (owner) and agents in nuketown-broker group can access
     systemd.tmpfiles.rules = lib.mkIf (sudoAgents != {} && cfg.humanUser != null) [
-      "d /run/sudo-approval 0755 ${cfg.humanUser} users -"
+      "d /run/nuketown-broker 2750 ${cfg.humanUser} nuketown-broker -"
+      "d /run/sops-age 0773 root nuketown-secrets -"
     ];
 
     # The approval daemon runs as a user service under the human's
     # session so it has access to the X11/Wayland display for zenity.
     # Enabled via home-manager for the human user, or manually:
-    #   systemctl --user start sudo-approval-daemon
+    #   systemctl --user start nuketown-broker
     #
     # Nuketown provides the service unit but doesn't know which user
     # is "the human" — import nuketown.homeManagerModules.approvalDaemon

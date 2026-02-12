@@ -83,7 +83,7 @@ assert_contains() {
   local needle="$2"
   local message="${3:-Output should contain '$needle'}"
 
-  if echo "$haystack" | grep -qF "$needle"; then
+  if echo "$haystack" | grep -qF -- "$needle"; then
     pass "$message"
     return 0
   else
@@ -97,7 +97,7 @@ assert_not_contains() {
   local needle="$2"
   local message="${3:-Output should not contain '$needle'}"
 
-  if ! echo "$haystack" | grep -qF "$needle"; then
+  if ! echo "$haystack" | grep -qF -- "$needle"; then
     pass "$message"
     return 0
   else

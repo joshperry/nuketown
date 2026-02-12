@@ -252,9 +252,92 @@ in {
 
   module-tmpfiles = mkCheck "module-tmpfiles" (let
     rules = fullCfg.systemd.tmpfiles.rules;
-    hasApprovalDir = builtins.any (r: nixpkgs.lib.hasInfix "sudo-approval" r) rules;
+    hasBrokerDir = builtins.any (r: nixpkgs.lib.hasInfix "nuketown-broker" r) rules;
+    hasSopsAgeDir = builtins.any (r: nixpkgs.lib.hasInfix "sops-age" r) rules;
+    brokerRule = builtins.head (builtins.filter (r: nixpkgs.lib.hasInfix "nuketown-broker" r) rules);
+    sopsRule = builtins.head (builtins.filter (r: nixpkgs.lib.hasInfix "sops-age" r) rules);
   in [
-    (assertEq "tmpfiles has approval dir" hasApprovalDir true)
+    (assertEq "tmpfiles has broker dir" hasBrokerDir true)
+    (assertEq "tmpfiles has sops-age dir" hasSopsAgeDir true)
+    (assertContains "broker dir mode 2750" brokerRule "2750")
+    (assertContains "broker dir owner is human" brokerRule "human")
+    (assertContains "broker dir group is nuketown-broker" brokerRule "nuketown-broker")
+    (assertContains "sops-age dir mode 0773" sopsRule "0773")
+    (assertContains "sops-age dir group is nuketown-secrets" sopsRule "nuketown-secrets")
+  ]);
+
+  # ── Broker Groups ──────────────────────────────────────────────
+
+  module-broker-groups = mkCheck "module-broker-groups" [
+    (assertEq "nuketown-broker group exists"
+      (builtins.hasAttr "nuketown-broker" fullCfg.users.groups) true)
+    (assertEq "nuketown-secrets group exists"
+      (builtins.hasAttr "nuketown-secrets" fullCfg.users.groups) true)
+    (assertEq "ada in nuketown-broker group"
+      (builtins.elem "nuketown-broker" fullCfg.users.users.ada.extraGroups) true)
+    (assertEq "human in nuketown-secrets group"
+      (builtins.elem "nuketown-secrets" fullCfg.users.users.human.extraGroups) true)
+  ];
+
+  # No broker groups when no sudo agents
+  module-no-broker-groups = mkCheck "module-no-broker-groups" [
+    (assertEq "no nuketown-broker group without sudo agents"
+      (builtins.hasAttr "nuketown-broker" customCfg.users.groups) false)
+    (assertEq "no nuketown-secrets group without sudo agents"
+      (builtins.hasAttr "nuketown-secrets" customCfg.users.groups) false)
+  ];
+
+  # ── Sudoex-run in Sudoers ─────────────────────────────────────
+
+  module-sudoex-run = mkCheck "module-sudoex-run" (let
+    rules = fullCfg.security.sudo.extraRules;
+    adaRule = builtins.head (builtins.filter (r: builtins.elem "ada" r.users) rules);
+    commands = adaRule.commands;
+    hasApprovalWrapper = builtins.any (c: nixpkgs.lib.hasInfix "sudo-with-approval" c.command) commands;
+    hasSudoexRun = builtins.any (c: nixpkgs.lib.hasInfix "sudoex-run" c.command) commands;
+    sudoexRunCmd = builtins.head (builtins.filter (c: nixpkgs.lib.hasInfix "sudoex-run" c.command) commands);
+  in [
+    (assertEq "sudo-with-approval in sudoers" hasApprovalWrapper true)
+    (assertEq "sudoex-run in sudoers" hasSudoexRun true)
+    (assertEq "sudoex-run is NOPASSWD"
+      (builtins.elem "NOPASSWD" sudoexRunCmd.options) true)
+    (assertEq "sudoex-run is SETENV"
+      (builtins.elem "SETENV" sudoexRunCmd.options) true)
+  ]);
+
+  # ── Agent Packages (broker scripts) ───────────────────────────
+
+  module-agent-packages = mkCheck "module-agent-packages" (let
+    pkgNames = map (p: p.name) adaHM.home.packages;
+  in [
+    # Sudo-enabled agents should have all broker client scripts
+    (assertEq "ada has sudoex" (builtins.elem "sudoex" pkgNames) true)
+    (assertEq "ada has sops-unlock" (builtins.elem "sops-unlock" pkgNames) true)
+    (assertEq "ada has sops-lock" (builtins.elem "sops-lock" pkgNames) true)
+    (assertEq "ada has nuketown-switch" (builtins.elem "nuketown-switch" pkgNames) true)
+    (assertEq "ada has sudo shim" (builtins.elem "sudo" pkgNames) true)
+  ]);
+
+  # Non-sudo agent should NOT have broker client scripts
+  module-no-sudo-no-broker-scripts = mkCheck "module-no-sudo-no-broker-scripts" (let
+    pkgNames = map (p: p.name) botHM.home.packages;
+  in [
+    (assertEq "bot lacks sudoex" (builtins.elem "sudoex" pkgNames) false)
+    (assertEq "bot lacks sops-unlock" (builtins.elem "sops-unlock" pkgNames) false)
+    (assertEq "bot lacks sops-lock" (builtins.elem "sops-lock" pkgNames) false)
+    (assertEq "bot lacks nuketown-switch" (builtins.elem "nuketown-switch" pkgNames) false)
+    (assertEq "bot lacks sudo shim" (builtins.elem "sudo" pkgNames) false)
+  ]);
+
+  # ── System Packages (approval wrapper + sudoex-run) ────────────
+
+  module-system-packages = mkCheck "module-system-packages" (let
+    sysPkgNames = map (p: p.name) fullCfg.environment.systemPackages;
+  in [
+    (assertEq "sudo-with-approval in system packages"
+      (builtins.elem "sudo-with-approval" sysPkgNames) true)
+    (assertEq "sudoex-run in system packages"
+      (builtins.elem "sudoex-run" sysPkgNames) true)
   ]);
 
   # ── Claude Code Integration Checks ─────────────────────────────

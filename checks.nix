@@ -379,9 +379,10 @@ in {
 
   claude-code-agent-prompt-sudo = mkCheck "claude-code-agent-prompt-sudo" [
     (assertContains "sudo heading" adaPrompt "## Sudo")
-    (assertContains "sudo approval daemon" adaPrompt "approval daemon")
-    (assertContains "sudo no password" adaPrompt "You never have a")
-    (assertContains "sudo interactive approval" adaPrompt "interactive approval")
+    (assertContains "sudo approval system" adaPrompt "approval")
+    (assertContains "sudo no password" adaPrompt "do not have a password")
+    (assertContains "sudoex" adaPrompt "sudoex")
+    (assertContains "nuketown-switch" adaPrompt "nuketown-switch")
   ];
 
   claude-code-agent-prompt-devices = mkCheck "claude-code-agent-prompt-devices" [
@@ -404,6 +405,10 @@ in {
     (assertContains "role in CLAUDE.md" adaClaudeMd "**Role**: software")
     (assertContains "environment in CLAUDE.md" adaClaudeMd "ephemeral")
     (assertContains "no frontmatter in CLAUDE.md" adaClaudeMd "## Identity")
+    (assertContains "ada working style" adaClaudeMd "## Working Style")
+    (assertContains "ada collaborator" adaClaudeMd "collaborator")
+    (assertContains "ada no TTY" adaClaudeMd "no TTY")
+    (assertContains "ada nuketown-switch workflow" adaClaudeMd "nuketown-switch")
   ];
 
   # ── Disabled Claude Code ────────────────────────────────────────

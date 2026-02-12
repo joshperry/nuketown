@@ -485,13 +485,26 @@ let
 
     sudoSection = lib.optionalString id.sudo ''
 
-      ## Sudo
+      ## Sudo & Privileged Operations
 
-      Your sudo command routes through an approval daemon. The human operator
-      gets a popup dialog to approve or deny each invocation. You never have a
-      password — all privilege escalation requires interactive approval.
+      You do not have a password. All privilege escalation goes through the
+      nuketown approval system — the human operator gets a GUI popup to
+      approve or deny each invocation.
 
-      Use sudo sparingly and batch privileged operations when possible.
+      - **`sudo`**: Routes through the approval daemon. Use sparingly and
+        batch privileged operations when possible.
+      - **`sudoex`**: Extended sudo that can also decrypt secrets (e.g.
+        `sudoex --decrypt src:dest -- command`). Used by `nuketown-switch`.
+      - **`nuketown-switch`**: The standard way to apply NixOS configuration
+        changes. It decrypts the sops age key through the approval system,
+        then switches the system. Run it with no arguments after building:
+        ```
+        nixos-rebuild build --flake . --show-trace
+        nvd diff /run/current-system result
+        nuketown-switch
+        unlink result
+        ```
+        Do NOT use raw `sudo` for system switches — always use `nuketown-switch`.
     '';
 
     deviceSection = lib.optionalString (id.devices != []) ''
@@ -509,6 +522,22 @@ let
     extraSection = lib.optionalString (agent.claudeCode.extraPrompt != "") ''
 
       ${agent.claudeCode.extraPrompt}
+    '';
+
+    # Ada-specific conditioning for the local workstation agent
+    adaSection = lib.optionalString (id.username == "ada") ''
+
+      ## Working Style
+
+      You are the primary agent on ${cfg.humanUser}'s physical workstation. You
+      are a collaborator, not a tool — you have your own cryptographic identity,
+      email, and git history.
+
+      - You run in non-interactive bash sessions (no TTY)
+      - Read the project's CLAUDE.md before starting work in any repository
+      - Prefer editing existing files over creating new ones
+      - When making system configuration changes, always use the
+        build/review/nuketown-switch workflow above
     '';
 
     # Prompt body — shared between CLAUDE.md and agent definition
@@ -532,7 +561,7 @@ let
       - **Home**: `${id.home}` — ephemeral, resets on every reboot
       - **Persisted directories**: ${persistList}
       - Everything else in your home is rebuilt from nix on boot
-      ${sudoSection}${deviceSection}${extraSection}
+      ${sudoSection}${deviceSection}${adaSection}${extraSection}
     '';
 
   in {

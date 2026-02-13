@@ -303,8 +303,14 @@ XMPP: "ada, work on nuketown -- fix udev block device handling"
 
 ### Session Lifecycle
 
-- **Interactive (portal/local):** daemon launches claude-code CLI,
-  fire-and-forget. Human watches via portal.
+- **Interactive (portal/local):** daemon launches claude-code CLI in
+  a tmux session named after the project basename (e.g., `nuketown`).
+  The portal command uses the same naming convention — if the session
+  already exists, it attaches rather than creating a new one. This
+  means the daemon can start a session before the human opens a portal,
+  and `portal-ada` just connects to what's already running. No
+  coordination needed between daemon and portal beyond the shared
+  tmux session name.
 - **Headless (cloud/automated):** daemon runs Agent SDK query directly.
   Streams meaningful progress to XMPP. Enforces timeout (default 4h).
 - **Queue:** one task at a time. Second request gets queued with

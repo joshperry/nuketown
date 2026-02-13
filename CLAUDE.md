@@ -650,6 +650,19 @@ mynix imports `nuketown.nixosModules.default` for production agent management on
 - `/home/josh/dev/mynix/CLAUDE.md`: Workflow for agents working with NixOS configs
 - `/home/josh/dev/mynix/machines/signi/configuration.nix`: Production `nuketown.agents.ada` config
 
+## Operational Notes
+
+### 6bit.com Services (verified 2026-02-13)
+
+Ada's email credential (`ada/email-password` in sops) authenticates against
+dovecot dict auth on liver.6bit.com. Same password works for all services:
+
+- **IMAP** (port 993, TLS) — verified working
+- **SMTP** (port 465, TLS) — verified working
+- **XMPP** (port 5222, STARTTLS) — Prosody with dovecot dict auth, same credential
+
+JID = email = `ada@6bit.com`. No separate XMPP account provisioning needed.
+
 ## Philosophy
 
 From the README:

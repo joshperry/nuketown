@@ -752,12 +752,18 @@ in
 
             path=$1
             if [ "$#" -eq 0 ]; then
-              selection=$(find ${lib.concatMapStringsSep " " (d: ''"${d}"'') cfg.projectDirs} \
+              # Expand ~ to $HOME in projectDirs
+              project_dirs=()
+              for d in ${lib.concatMapStringsSep " " (d: ''"${d}"'') cfg.projectDirs}; do
+                project_dirs+=("''${d/#\~/$HOME}")
+              done
+
+              selection=$(find "''${project_dirs[@]}" \
                 -maxdepth 2 -type d -not -path '*/.*' -printf '%P\n' 2>/dev/null | \
                 ${pkgs.fzf}/bin/fzf --prompt="${name}> ")
               [[ -z "$selection" ]] && exit 1
               # Resolve the full path from whichever projectDir matched
-              for dir in ${lib.concatMapStringsSep " " (d: ''"${d}"'') cfg.projectDirs}; do
+              for dir in "''${project_dirs[@]}"; do
                 if [ -d "$dir/$selection" ]; then
                   path="$dir/$selection"
                   break

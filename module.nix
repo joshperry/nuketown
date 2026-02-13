@@ -346,23 +346,24 @@ let
           default = false;
           description = ''
             Generate a tmux portal command for this agent.
-            Opens a tmux window with the agent running in the top pane
-            and your shell in the bottom pane, both in the project dir.
+            Opens a side-by-side tmux window with your shell on the left
+            and the agent on the right, working in its own project clone
+            at <agentsDir>/<agent>/projects/<project>.
           '';
         };
         command = lib.mkOption {
           type = lib.types.str;
           default = "${pkgs.unstable.claude-code}/bin/claude --dangerously-skip-permissions";
           description = ''
-            Command to run as the agent in the top pane.
+            Command to run as the agent in the right pane.
             Defaults to claude-code via direct store path. Replace
             with a custom shell agent when you build one.
           '';
         };
         layout = lib.mkOption {
           type = lib.types.str;
-          default = "75/25";
-          description = "Pane split ratio (agent/human). '75/25' or '50/50'.";
+          default = "50/50";
+          description = "Pane split ratio (agent/human). '50/50' or '75/25'.";
         };
       };
 
@@ -646,7 +647,7 @@ in
 
     basePackages = lib.mkOption {
       type = lib.types.listOf lib.types.package;
-      default = with pkgs; [ git ripgrep fd jq curl tree ];
+      default = with pkgs; [ git ripgrep fd jq curl tree tmux ];
       description = "Packages available to all agents";
     };
 
@@ -717,8 +718,9 @@ in
     ];
 
     # ── Portal Scripts ───────────────────────────────────────────
-    # Per-agent tmux portal: fzf pick a project, open a window with
-    # the agent in the top pane and your shell in the bottom.
+    # Per-agent tmux portal: fzf pick a project, open a side-by-side
+    # window with your shell on the left and the agent on the right.
+    # The agent works in its own clone at <agentsDir>/<agent>/projects/<project>.
 
     environment.systemPackages =
       (lib.optionals (sudoAgents != {}) [ approvalWrapper sudoexRun ])
@@ -727,15 +729,20 @@ in
           let
             splitPercent = let
               parts = lib.splitString "/" agent.portal.layout;
-            in lib.elemAt parts 1;
+            in lib.elemAt parts 0;
 
             # Helper: shell into the agent via machinectl with a login
-            # environment, cd to the project, and exec the agent command.
+            # environment, cd to the agent's project clone, and launch the
+            # agent command inside a dedicated tmux server. The agent gets
+            # its own tmux server (portal-${name}) so it can freely create
+            # panes without access to the human's session. The outer pane
+            # in josh's tmux just shows the agent's server with status off
+            # for a seamless nested view.
             # bash -l loads the agent's full home-manager profile via PAM.
             agentLauncher = pkgs.writeShellScript "portal-launcher-${name}" ''
               path="$1"
               shift
-              exec sudo ${pkgs.systemd}/bin/machinectl shell ${name}@ ${pkgs.bash}/bin/bash -l -c "cd '$path' && exec ${agent.portal.command} $*"
+              exec sudo ${pkgs.systemd}/bin/machinectl shell ${name}@ ${pkgs.bash}/bin/bash -l -c "mkdir -p '$path' && cd '$path' && TMUX= exec ${pkgs.tmux}/bin/tmux -L portal-${name} new-session -s portal \\; set -g status off \\; send-keys '${agent.portal.command} $*' C-m"
             '';
           in
           pkgs.writeShellScriptBin "portal-${name}" ''
@@ -763,11 +770,12 @@ in
             fi
 
             wname=$(basename "$path")
+            agent_path="${cfg.agentsDir}/${name}/projects/$wname"
 
             ${pkgs.tmux}/bin/tmux new-window -c "$path" -n "$wname"
-            ${pkgs.tmux}/bin/tmux send-keys "${agentLauncher} \"$path\"" C-m
-            ${pkgs.tmux}/bin/tmux split-window -v -l ${splitPercent}% -c "$path"
-            ${pkgs.tmux}/bin/tmux last-pane
+            ${pkgs.tmux}/bin/tmux split-window -h -l ${splitPercent}% -c "$path"
+            ${pkgs.tmux}/bin/tmux send-keys "${agentLauncher} \"$agent_path\"" C-m
+            ${pkgs.tmux}/bin/tmux select-pane -L
           ''
         )
       ) enabledAgents)

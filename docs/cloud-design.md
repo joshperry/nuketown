@@ -75,45 +75,139 @@ documenting the JID and available rooms.
 
 ### Approval Over XMPP
 
-The approval broker gains an XMPP backend alongside zenity:
+### Auth Broker as XMPP Client
+
+The approval broker runs its own XMPP client session on the **human's**
+side, connecting as `josh@6bit.com/nuketown-broker`. This is a separate
+session from the human's chat client — the broker is a dedicated
+approval surface, not a chat window.
 
 ```
 agent runs `sudo <cmd>`
   -> sudo shim (unchanged)
     -> broker socket (unchanged)
-      -> broker sends XMPP message to human's JID
-        -> human replies "yes <id>" or "no <id>"
-          -> broker writes APPROVED/DENIED to socket
+      -> broker sends custom XMPP stanza to human's bare JID
+      -> broker shows zenity popup (if local desktop available)
+      <- first response wins (XMPP reply or zenity click)
+        -> broker writes APPROVED/DENIED to socket
 ```
 
 The Unix socket between agent and broker stays — it's the security
-boundary. XMPP replaces only the human-facing notification channel.
+boundary. The broker's XMPP client and zenity are two parallel
+notification channels to the human. First response wins.
 
-**Hybrid mode:** When both backends are available, the broker sends a
-zenity popup AND an XMPP message. First response wins. This preserves
-local desktop workflow while enabling remote approval.
+### Custom Stanza Namespace
 
-**Message format:**
+Approval requests use a custom XML namespace, not plain chat messages:
+
+```xml
+<message to="josh@6bit.com" id="a1b2c3" type="normal">
+  <approval xmlns="urn:nuketown:approval" id="a1b2c3">
+    <agent>ada</agent>
+    <kind>sudo</kind>
+    <command>nixos-rebuild switch</command>
+    <timeout>120</timeout>
+  </approval>
+</message>
 ```
-[Approval #a1b2c3]
-Agent: ada
-Command: nixos-rebuild switch
-Reply "yes a1b2c3" or "no a1b2c3"
+
+Different request kinds use the same namespace with different `<kind>`
+values:
+
+| Kind | Payload | Example |
+|------|---------|---------|
+| `sudo` | `<command>` | `nixos-rebuild switch` |
+| `delegate` | `<task>`, `<agents>` | Spawn 3 researchers for API review |
+| `scale` | `<from>`, `<to>` | `standard` → `large` |
+| `network` | `<egress>` | Allow `pypi.org:443` |
+
+Responses use the same namespace:
+
+```xml
+<message to="ada@6bit.com" type="normal">
+  <approval-response xmlns="urn:nuketown:approval" id="a1b2c3">
+    <result>approved</result>
+  </approval-response>
+</message>
 ```
 
-Short hex IDs for human-friendly typing. Timeout after 120s (configurable),
-auto-deny on timeout.
+This keeps the protocol structured and extensible without inventing
+a new transport.
 
-**Approval generalizes beyond sudo in the cloud:**
+### Server-Side Filtering
+
+Prosody routes stanzas based on namespace, so the auth broker and
+chat client never interfere:
+
+```
+agent sends <message> to josh@6bit.com
+  ├── has <approval xmlns="urn:nuketown:approval">
+  │     -> route to resource advertising urn:nuketown:approval (broker)
+  └── plain <message type="chat">
+        -> route to chat client per normal XMPP rules
+```
+
+Implementation: a small Prosody module (deployed via mynix/liver) that
+inspects incoming messages for the `urn:nuketown:approval` namespace
+and routes them to the resource that advertises that feature via
+service discovery (XEP-0030). The broker advertises the feature on
+connect; the chat client doesn't.
+
+This means agents don't need to know the broker's full JID — they
+send to the bare JID and the server handles routing. If the broker
+is offline, the message falls through to normal delivery (chat client
+gets it as a fallback notification).
+
+### Zenity Styling Per Agent
+
+When the broker is running on a local desktop, zenity popups are
+styled per agent — different agents get distinct visual treatment
+so the human can tell at a glance who's asking:
+
+```
+┌─ ada (software) ─────────────────────┐
+│  sudo: nixos-rebuild switch          │
+│                                      │
+│           [Approve]  [Deny]          │
+└──────────────────────────────────────┘
+
+┌─ vox (research) ─────────────────────┐
+│  delegate: spawn 2 search agents     │
+│  for: "survey XMPP client libraries" │
+│                                      │
+│           [Approve]  [Deny]          │
+└──────────────────────────────────────┘
+```
+
+### Delegation as Approval
+
+Agent team spawning flows through the same approval surface as sudo.
+An agent that wants teammates requests delegation:
+
+```
+ada: I need to parallelize this — can I spin up 3 researchers?
+  -> delegation request via urn:nuketown:approval (kind=delegate)
+  -> broker shows zenity / sends to chat client
+  -> human approves
+  -> broker responds approved
+  -> agent (or daemon) spawns teammates
+```
+
+Same model everywhere: escalation needs a human, de-escalation is free.
+Spawning costs money and compute — it's an escalation.
+
+### Approval Generalizes
 
 | Escalation | Local | Cloud |
 |-----------|-------|-------|
-| Sudo | Zenity dialog | XMPP approval |
-| More resources | N/A (fixed hardware) | XMPP approval -> pod reschedule |
-| GPU access | N/A (plug in device) | XMPP approval -> GPU node pool |
-| Network access | N/A (local network) | XMPP approval -> NetworkPolicy update |
+| Sudo | Zenity + XMPP | XMPP (no desktop) |
+| Delegation | Zenity + XMPP | XMPP |
+| More resources | N/A (fixed hardware) | XMPP -> pod reschedule |
+| GPU access | N/A (plug in device) | XMPP -> GPU node pool |
+| Network access | N/A (local network) | XMPP -> NetworkPolicy update |
 
-Same model: human-in-the-loop for escalation, automatic for de-escalation.
+Timeout after 120s (configurable), auto-deny on timeout. Short hex IDs
+for correlation across channels.
 
 ### Presence
 

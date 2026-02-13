@@ -742,7 +742,8 @@ in
             agentLauncher = pkgs.writeShellScript "portal-launcher-${name}" ''
               path="$1"
               shift
-              exec sudo /run/current-system/sw/bin/machinectl shell ${name}@ ${pkgs.bash}/bin/bash -l -c "mkdir -p '$path' && cd '$path' && TMUX= exec ${pkgs.tmux}/bin/tmux -L portal-${name} new-session -s portal \\; set -g status off \\; send-keys '${agent.portal.command} $*' C-m"
+              session=$(basename "$path")
+              exec sudo /run/current-system/sw/bin/machinectl shell ${name}@ ${pkgs.bash}/bin/bash -l -c "mkdir -p '$path' && cd '$path' && TMUX= exec ${pkgs.tmux}/bin/tmux -L portal-${name} new-session -As '$session' \\; set -g status off \\; send-keys '${agent.portal.command} $*' C-m"
             '';
           in
           pkgs.writeShellScriptBin "portal-${name}" ''

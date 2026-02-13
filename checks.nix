@@ -173,11 +173,37 @@ let
     };
   };
 
+  # Agent with daemon enabled
+  daemonConfig = { pkgs, ... }: {
+    nuketown = {
+      enable = true;
+      domain = "nuketown.test";
+      humanUser = "human";
+      agents.ada = {
+        enable = true;
+        uid = 1100;
+        role = "software";
+        description = "Test daemon agent";
+        sudo.enable = true;
+        daemon = {
+          enable = true;
+          package = pkgs.hello;  # placeholder for eval checks
+          repos = {
+            nuketown = { url = "git@github.com:test/nuketown.git"; };
+            mynix = { url = "git@github.com:test/mynix.git"; };
+          };
+          apiKeySecret = "ada/anthropic-key";
+        };
+      };
+    };
+  };
+
   # ── Evaluated Configs ─────────────────────────────────────────────
 
   fullCfg = evalConfig fullAgentConfig [];
   noCCCfg = evalConfig noClaudeCodeConfig [];
   customCfg = evalConfig customNamingConfig [];
+  daemonCfg = evalConfig daemonConfig [];
 
   # Shorthand accessors
   adaHM = fullCfg.home-manager.users.ada;
@@ -189,6 +215,8 @@ let
 
   botHM = customCfg.home-manager.users.bot;
   botCC = botHM.programs.claude-code;
+
+  daemonAdaHM = daemonCfg.home-manager.users.ada;
 
 in {
 
@@ -448,5 +476,49 @@ in {
   in [
     (assertNotContains "no about section" botPrompt "## About You")
   ]);
+
+  # ── Daemon Checks ──────────────────────────────────────────────
+
+  daemon-linger = mkCheck "daemon-linger" [
+    (assertEq "daemon agent has linger" daemonCfg.users.users.ada.linger true)
+  ];
+
+  daemon-service = mkCheck "daemon-service" (let
+    svc = daemonAdaHM.systemd.user.services.nuketown-daemon;
+    execStart = builtins.head svc.Service.ExecStart;
+  in [
+    (assertEq "daemon service type" svc.Service.Type "simple")
+    (assertContains "daemon ExecStart" execStart "nuketown-daemon")
+    (assertEq "daemon restart" svc.Service.Restart "always")
+    (assertEq "daemon restart sec" svc.Service.RestartSec 5)
+    (assertEq "daemon wanted by default.target"
+      svc.Install.WantedBy [ "default.target" ])
+    (assertEq "daemon env has bootstrap model"
+      (builtins.any (e: nixpkgs.lib.hasInfix "NUKETOWN_BOOTSTRAP_MODEL=" e) svc.Service.Environment) true)
+    (assertEq "daemon env has API key file"
+      (builtins.any (e: nixpkgs.lib.hasInfix "ANTHROPIC_API_KEY_FILE=" e) svc.Service.Environment) true)
+  ]);
+
+  daemon-repos-toml = mkCheck "daemon-repos-toml" (let
+    toml = daemonAdaHM.xdg.configFile."nuketown/repos.toml".text;
+  in [
+    (assertContains "repos.toml has nuketown section" toml "[nuketown]")
+    (assertContains "repos.toml has nuketown url" toml "git@github.com:test/nuketown.git")
+    (assertContains "repos.toml has mynix section" toml "[mynix]")
+    (assertContains "repos.toml has mynix url" toml "git@github.com:test/mynix.git")
+  ]);
+
+  daemon-api-key-secret = mkCheck "daemon-api-key-secret" [
+    (assertEq "sops secret for API key exists"
+      (builtins.hasAttr "ada/anthropic-key" daemonCfg.sops.secrets) true)
+    (assertEq "sops secret owner is ada"
+      daemonCfg.sops.secrets."ada/anthropic-key".owner "ada")
+  ];
+
+  daemon-disabled = mkCheck "daemon-disabled" [
+    (assertEq "no linger when daemon disabled" fullCfg.users.users.ada.linger false)
+    (assertEq "no daemon service when disabled"
+      (builtins.hasAttr "nuketown-daemon" adaHM.systemd.user.services) false)
+  ];
 
 }

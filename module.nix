@@ -424,12 +424,51 @@ let
           '';
         };
       };
+
+      daemon = {
+        enable = lib.mkEnableOption "Nuketown agent daemon";
+
+        package = lib.mkOption {
+          type = lib.types.package;
+          description = "Nuketown daemon package";
+        };
+
+        bootstrapModel = lib.mkOption {
+          type = lib.types.str;
+          default = "claude-haiku-4-5-20251001";
+          description = "Model for LLM bootstrap fallback";
+        };
+
+        apiKeySecret = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = "sops secret name for Anthropic API key";
+        };
+
+        repos = lib.mkOption {
+          type = lib.types.attrsOf (lib.types.submodule {
+            options.url = lib.mkOption {
+              type = lib.types.str;
+              description = "Git remote URL";
+            };
+          });
+          default = {};
+          description = "Known git remotes for workspace bootstrap";
+        };
+
+        headlessTimeout = lib.mkOption {
+          type = lib.types.int;
+          default = 14400;
+          description = "Timeout in seconds for headless sessions (default 4h)";
+        };
+      };
     };
   };
 
   enabledAgents = lib.filterAttrs (_: a: a.enable) cfg.agents;
   sudoAgents = lib.filterAttrs (_: a: a.enable && a.sudo.enable) cfg.agents;
   claudeCodeAgents = lib.filterAttrs (_: a: a.enable && a.claudeCode.enable) cfg.agents;
+  daemonAgents = lib.filterAttrs (_: a: a.enable && a.daemon.enable) cfg.agents;
 
   # ── Shared Agent Identity ──────────────────────────────────────
   # Single source of truth for agent identity facts.
@@ -817,6 +856,7 @@ in
         home = "${cfg.agentsDir}/${name}";
         shell = pkgs.bash;
         extraGroups = lib.optional agent.sudo.enable "nuketown-broker";
+        linger = agent.daemon.enable;
       }) enabledAgents)
       # Human user needs nuketown-secrets to write decrypted keys via broker
       (lib.mkIf (sudoAgents != {} && cfg.humanUser != null) {
@@ -893,6 +933,41 @@ in
           } // agent.claudeCode.extraAgents;
         };
       }))
+
+      # ── Daemon Integration ────────────────────────────────────────
+      # Generate repos.toml and a systemd user service for the daemon.
+      (lib.optionalAttrs agent.daemon.enable {
+        xdg.configFile."nuketown/repos.toml".text =
+          lib.concatStringsSep "\n" (lib.mapAttrsToList (repoName: repo: ''
+            [${repoName}]
+            url = "${repo.url}"
+          '') agent.daemon.repos);
+
+        systemd.user.services.nuketown-daemon = {
+          Unit = {
+            Description = "Nuketown agent daemon";
+            After = [ "default.target" ];
+          };
+          Service = {
+            Type = "simple";
+            ExecStart = "${agent.daemon.package}/bin/nuketown-daemon";
+            Restart = "always";
+            RestartSec = 5;
+            Environment = lib.mkMerge [
+              [
+                "NUKETOWN_BOOTSTRAP_MODEL=${agent.daemon.bootstrapModel}"
+                "NUKETOWN_HEADLESS_TIMEOUT=${toString agent.daemon.headlessTimeout}"
+              ]
+              (lib.mkIf (agent.daemon.apiKeySecret != null) [
+                "ANTHROPIC_API_KEY_FILE=%d/anthropic-api-key"
+              ])
+            ];
+          };
+          Install = {
+            WantedBy = [ "default.target" ];
+          };
+        };
+      })
 
       # User-provided extraHomeConfig merges last (can override anything above)
       agent.extraHomeConfig
@@ -1016,6 +1091,12 @@ in
         inherit sopsFile;
         owner = name;
       }) agent.secrets.extraSecrets
+      // lib.optionalAttrs (agent.daemon.apiKeySecret != null) {
+        "${agent.daemon.apiKeySecret}" = {
+          inherit sopsFile;
+          owner = name;
+        };
+      }
     ) enabledAgents);
   });
 }

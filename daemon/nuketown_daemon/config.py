@@ -1,0 +1,126 @@
+"""Configuration loading for nuketown-daemon.
+
+Reads identity.toml, repos.toml, env vars, and discovers git repos
+in ~/projects/.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class RepoConfig:
+    """A known repository."""
+
+    name: str
+    url: str = ""
+    branch: str = ""
+
+
+def _default_socket_path() -> Path:
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    return Path(runtime_dir) / "nuketown-daemon.sock"
+
+
+@dataclass
+class DaemonConfig:
+    """Complete daemon configuration."""
+
+    # Identity (from identity.toml)
+    agent_name: str = ""
+    role: str = ""
+    email: str = ""
+    domain: str = ""
+    home: str = ""
+    uid: int = 0
+
+    # Paths
+    projects_dir: Path = field(default_factory=lambda: Path.home() / "projects")
+    socket_path: Path = field(default_factory=_default_socket_path)
+
+    # Known repos (merged from repos.toml + discovered)
+    repos: dict[str, RepoConfig] = field(default_factory=dict)
+
+    # Command to launch in tmux sessions
+    agent_command: str = "claude-code"
+
+
+def load_identity(path: Path | None = None) -> dict:
+    """Load identity.toml, returning raw dict."""
+    if path is None:
+        path = (
+            Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+            / "nuketown"
+            / "identity.toml"
+        )
+    if not path.exists():
+        log.warning("identity.toml not found at %s", path)
+        return {}
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def load_repos_toml(path: Path | None = None) -> dict[str, RepoConfig]:
+    """Load repos.toml, returning dict of name -> RepoConfig."""
+    if path is None:
+        path = (
+            Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+            / "nuketown"
+            / "repos.toml"
+        )
+    if not path.exists():
+        return {}
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    repos = {}
+    for name, entry in data.items():
+        if isinstance(entry, dict):
+            repos[name] = RepoConfig(
+                name=name,
+                url=entry.get("url", ""),
+                branch=entry.get("branch", ""),
+            )
+    return repos
+
+
+def discover_repos(projects_dir: Path) -> dict[str, RepoConfig]:
+    """Scan projects_dir for directories containing .git."""
+    repos = {}
+    if not projects_dir.is_dir():
+        return repos
+    for child in sorted(projects_dir.iterdir()):
+        if child.is_dir() and (child / ".git").exists():
+            repos[child.name] = RepoConfig(name=child.name)
+    return repos
+
+
+def load_config() -> DaemonConfig:
+    """Build DaemonConfig from all sources."""
+    identity = load_identity()
+
+    home = Path(identity.get("home", str(Path.home())))
+    projects_dir = home / "projects"
+
+    cfg = DaemonConfig(
+        agent_name=identity.get("name", os.environ.get("USER", "agent")),
+        role=identity.get("role", ""),
+        email=identity.get("email", ""),
+        domain=identity.get("domain", ""),
+        home=str(home),
+        uid=identity.get("uid", os.getuid()),
+        projects_dir=projects_dir,
+    )
+
+    # Merge repos: toml entries take precedence over discovered
+    discovered = discover_repos(projects_dir)
+    configured = load_repos_toml()
+    cfg.repos = {**discovered, **configured}
+
+    return cfg

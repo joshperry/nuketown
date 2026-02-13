@@ -1,5 +1,7 @@
 # Cloud Agent Design
 
+**One-liner:** Define an AI agent in Nix. Push to main. It's running in the cloud.
+
 This document describes the architecture for running nuketown agents
 remotely — outside the human's physical workstation — while preserving
 the identity, auditability, and approval guarantees of the local model.
@@ -11,6 +13,31 @@ Three work streams converge to make this possible:
 3. **K8s pods** — deployment target for cloud agents
 
 Each is independently useful and can be developed in parallel.
+
+### The Vercel analogy
+
+| Vercel | Nuketown Cloud |
+|--------|---------------|
+| Connect GitHub repo | ArgoCD watches repo |
+| Framework detection -> build | Nix evaluation -> OCI image |
+| Provisions infra automatically | K8s schedules pod from manifests |
+| Push to branch -> deploy | Push to branch -> ArgoCD sync |
+| Preview deploys on PRs | ArgoCD preview environments |
+| Dashboard for status | ArgoCD dashboard for agent status + logs |
+
+### Why Kubernetes, Not VMs
+
+Kubernetes replaces VM lifecycle management with one API:
+
+- **No provider abstraction needed.** K8s API is the same everywhere —
+  GKE, EKS, AKS, k3s on a VPS, k3s on your laptop.
+- **No VM lifecycle management.** Pods schedule, restart, and migrate
+  without custom code.
+- **No custom reconciler.** ArgoCD already watches repos, diffs state,
+  and converges. We just write a plugin that translates nix -> YAML.
+- **Orchestration features for free.** Vertical scaling, node affinity,
+  preemptible capacity, health checks, rolling updates — things we'd
+  never build for raw VMs.
 
 ---
 
@@ -77,6 +104,17 @@ Reply "yes a1b2c3" or "no a1b2c3"
 Short hex IDs for human-friendly typing. Timeout after 120s (configurable),
 auto-deny on timeout.
 
+**Approval generalizes beyond sudo in the cloud:**
+
+| Escalation | Local | Cloud |
+|-----------|-------|-------|
+| Sudo | Zenity dialog | XMPP approval |
+| More resources | N/A (fixed hardware) | XMPP approval -> pod reschedule |
+| GPU access | N/A (plug in device) | XMPP approval -> GPU node pool |
+| Network access | N/A (local network) | XMPP approval -> NetworkPolicy update |
+
+Same model: human-in-the-loop for escalation, automatic for de-escalation.
+
 ### Presence
 
 Agent presence maps to XMPP show states:
@@ -86,7 +124,7 @@ Agent presence maps to XMPP show states:
 | Idle | `chat` | Ready |
 | Working | `dnd` | Working: <task description> |
 | Blocked | `away` | Waiting for sudo approval |
-| Offline | — | Daemon not running |
+| Offline | --- | Daemon not running |
 
 The human sees agent status in their regular XMPP client.
 
@@ -114,17 +152,17 @@ in one asyncio event loop.
 
 ```
 Agent Daemon (systemd user service, Python/asyncio)
-├── XMPP client (slixmpp)
-│   ├── Presence publisher
-│   ├── Message handler (task requests, approval responses)
-│   └── MUC participant
-├── Bootstrap loop (Claude Haiku via Agent SDK)
-│   ├── Workspace resolver (clone, checkout, setup)
-│   └── Known remotes (from nix config + existing clones)
-├── Session launcher
-│   ├── Interactive: launch claude-code CLI
-│   └── Headless: run Agent SDK query, stream progress to XMPP
-└── Local socket listener (for portal integration)
++-- XMPP client (slixmpp)
+|   +-- Presence publisher
+|   +-- Message handler (task requests, approval responses)
+|   +-- MUC participant
++-- Bootstrap loop (Claude Haiku via Agent SDK)
+|   +-- Workspace resolver (clone, checkout, setup)
+|   +-- Known remotes (from nix config + existing clones)
++-- Session launcher
+|   +-- Interactive: launch claude-code CLI
+|   +-- Headless: run Agent SDK query, stream progress to XMPP
++-- Local socket listener (for portal integration)
 ```
 
 ### Bootstrap Flow
@@ -161,7 +199,7 @@ model.
 ### Request Model
 
 ```
-XMPP: "ada, work on nuketown — fix udev block device handling"
+XMPP: "ada, work on nuketown -- fix udev block device handling"
   -> parse task, extract "nuketown" as repo hint
   -> cache check: ~/projects/nuketown exists? yes -> skip bootstrap
   -> launch claude-code in ~/projects/nuketown with task context
@@ -200,6 +238,24 @@ Generates a systemd user service under the agent account:
 
 ## 3. K8s Pod Deployment
 
+### The NixOS config is the cloud API
+
+The NixOS configuration already declares everything about the agent's
+environment. The only thing missing is a thin translation layer that
+turns that declaration into something a cluster can run.
+
+You add `cloud.enable = true` to an agent, push to a branch, and a
+cluster schedules it:
+
+```
+git push origin main
+  -> ArgoCD detects change
+    -> runs nuketown plugin (nix eval -> k8s YAML)
+    -> diffs manifests vs cluster state
+    -> applies changes (create / update / delete pods)
+    -> agent is live
+```
+
 ### Image Strategy
 
 OCI images via `dockerTools.buildImage` from the agent's nix closure.
@@ -207,38 +263,141 @@ Push to container registry (Artifact Registry, GHCR, etc.).
 
 nix-snapshotter is not viable on managed GKE (cannot customize
 containerd plugins). It remains an option for self-hosted k3s on
-NixOS once the k3s patch is rebuilt.
+NixOS once the k3s patch is rebuilt. The k3s integration patch
+broke against nixpkgs k3s 1.34.3 (confirmed on signi 2026-02-12).
 
 ```nix
 nuketown.cloud.imageMode = "oci";  # default
 nuketown.cloud.registry = "ghcr.io/joshperry/nuketown";
 ```
 
+When nix-snapshotter is available (self-hosted k3s on NixOS), each
+agent's environment is a cached image layer with store-level
+deduplication. "Moving" an agent to a new node means pulling only
+the diff — near-instant for agents sharing a nix store.
+
 ### Pod Structure
 
 ```
 Pod: nuketown-<name>
-├── initContainer: identity-init
-│   Fetches secrets from KMS via workload identity.
-│   Writes SSH/GPG keys, identity.toml to shared volume.
-│
-├── container: agent (main)
-│   Runs the agent daemon (XMPP + bootstrap + session).
-│   Image: nix closure of agent packages.
-│   User: agent UID from nuketown config.
-│
-└── (no approval sidecar — approval goes through XMPP)
++-- initContainer: identity-init
+|   Fetches secrets from KMS via workload identity.
+|   Writes SSH/GPG keys, identity.toml to shared volume.
+|
++-- container: agent (main)
+|   Runs the agent daemon (XMPP + bootstrap + session).
+|   Image: nix closure of agent packages.
+|   User: agent UID from nuketown config.
+|
++-- (no approval sidecar -- approval goes through XMPP)
 ```
+
+### Minimal Cloud Config
+
+For the common case of "one agent in the cloud":
+
+```nix
+nuketown.cloud.enable = true;
+```
+
+One line on top of the existing nuketown agent config. The platform
+picks sensible defaults for everything else.
+
+### Resource Tiers
+
+Abstract away instance types entirely:
+
+| Tier | Intent | Rough shape |
+|------|--------|-------------|
+| `small` | Idle / light tasks | 1 vCPU, 2GB RAM |
+| `standard` | Normal development work | 2 vCPU, 4GB RAM |
+| `large` | Builds, compilation | 4 vCPU, 8GB RAM |
+| `gpu` | ML workloads | GPU node pool |
+
+The `toKubeManifests` function maps tiers to k8s resource
+requests/limits. Cluster operators configure node pools to satisfy
+them. Users never see instance types.
+
+```nix
+nuketown.cloud = {
+  enable = true;
+  resources = "standard";  # "small", "standard", "large", "gpu"
+
+  scaling = {
+    maxResources = "large";     # agent can request up to this
+    idleTimeout = 3600;         # seconds before scaling down
+  };
+};
+```
+
+### Scaling as Conversation
+
+The agent participates in its own infrastructure decisions, the same
+way a colleague would:
+
+```
+ada: This rotorflight build is thrashing -- I only have 2GB here.
+     Mind if I move to something bigger?
+josh: yes
+     *pod reschedules with 8GB, build resumes from nix cache*
+ada: Back. Build's done, flashing now.
+```
+
+The mechanism:
+1. Agent detects resource pressure (OOM warnings, CPU throttling)
+2. Agent requests scale-up via XMPP (same UX as sudo approval)
+3. Human approves (or auto-policy approves for known workloads)
+4. Scaling controller updates pod resource requests
+5. K8s reschedules pod on a suitable node
+6. Agent resumes from persisted state (PVCs reattach)
+
+Scaling *down* doesn't need approval — agents downsize automatically
+after idle timeout. Same approval asymmetry as sudo: escalation needs
+a human, de-escalation is free.
+
+### Node Migration
+
+Agent moves between node pools based on task:
+
+- **Idle**: spot/preemptible capacity (cheap)
+- **Working**: on-demand standard nodes
+- **Building**: beefy build nodes (maybe shared with CI)
+- **GPU task**: GPU node pool
+
+The agent doesn't manage this directly. The pod spec declares resource
+requests, k8s handles scheduling. But the conversation about needing
+more resources is natural and human-readable.
+
+### Self-Healing
+
+K8s restarts crashed agents automatically. No monitoring to build.
+The agent's state survives via persisted volumes. On restart:
+
+1. Pod schedules on available node
+2. PVC reattaches (persist dirs intact)
+3. OCI image loads from cache
+4. Agent boots into clean environment + persisted state
+5. Picks up where it left off
 
 ### Persistence: persist -> PVCs
 
 Direct mapping. Each `persist` entry becomes a PVC:
 
+| Nuketown config | K8s resource |
+|-----------------|--------------|
 | `persist = ["projects"]` | PVC `nuketown-ada-projects` |
 | `persist = [".config/claude"]` | PVC `nuketown-ada-config-claude` |
 | Agent home (ephemeral) | `emptyDir` (pod restart = reboot) |
 
 Pod restart gives the same clean-slate semantics as btrfs rollback.
+
+| Concern | Local (current) | Cloud (k8s) |
+|---------|----------------|-------------|
+| Ephemeral home | btrfs snapshot rollback in initrd | Pod restart = fresh container |
+| Persistence | bind-mounts from /persist (impermanence) | PVCs mounted at persist paths |
+| Boot time | Snapshot restore + home-manager activate | Image pull (cached) + PVC mount |
+| State drift | Possible between reboots | Impossible — every restart is fresh |
+| Rollback | Reboot | Redeploy previous image tag |
 
 ```nix
 nuketown.cloud.storageClass = null;  # cluster default
@@ -248,17 +407,40 @@ nuketown.cloud.agents.<name>.persistSizes = {
 };
 ```
 
-### Secrets Bootstrap
+### Secrets Bootstrap: Workload Identity
 
-Cloud agents can't use sops with a host age key. Instead:
+On a local machine, nuketown uses sops-nix — the machine has a host
+key, secrets decrypt at activation time. In the cloud, the pod *is*
+the credential:
 
 - **GKE:** Workload Identity Federation -> Google Secret Manager
 - **EKS:** IRSA -> AWS Secrets Manager
 - **k3s/self-hosted:** sealed-secrets or sops with age key in k8s Secret
 
+No key files. No bootstrap. No rotation. The workload identity extends
+the agent's reach to cloud APIs without adding a secret to manage.
+
+```
+Agent identity (nuketown)
+  +-- Unix user (uid, home, git, GPG)
+  +-- K8s ServiceAccount
+        +-- Cloud workload identity
+              +-- IAM roles scoped to agent prefix
+                    +-- storage: ada-* buckets/objects only
+                    +-- kms: decrypt agent secrets only
+                    +-- no IAM admin (can't escalate)
+```
+
 Init container authenticates via projected SA token, fetches SSH/GPG
 keys and XMPP password, writes to tmpfs emptyDir shared with main
-container.
+container. No key material ever touches persistent disk.
+
+```nix
+nuketown.agents.ada.cloud.identity = {
+  gcpServiceAccount = "ada-agent@myproject.iam.gserviceaccount.com";
+  scope = "ada-*";
+};
+```
 
 ### Identity Projection
 
@@ -296,7 +478,7 @@ Pure nix function that projects agent config into k8s YAML:
 ```nix
 nuketown.lib.toKubeManifests = config: {
   # Per agent: Namespace, ServiceAccount, Deployment,
-  # PVCs, NetworkPolicy, ConfigMap (identity.toml)
+  # PVCs, ResourceQuota, NetworkPolicy, ConfigMap (identity.toml)
 };
 ```
 
@@ -314,39 +496,80 @@ manually (`kubectl apply`) or via ArgoCD.
 
 ---
 
+## ArgoCD Integration
+
+ArgoCD replaces the entire custom reconciliation layer. The only
+nuketown-specific code is a config management plugin that translates
+nix -> k8s YAML.
+
+### How ArgoCD works here
+
+1. **Watch** — ArgoCD polls or receives webhook from GitHub on push
+2. **Evaluate** — ArgoCD runs the nuketown plugin, which calls
+   `nix eval` to discover agents with `cloud.enable = true`
+3. **Generate** — Plugin emits k8s manifests (Deployments, PVCs,
+   ServiceAccounts, ResourceQuotas)
+4. **Diff** — ArgoCD compares generated manifests against cluster state
+5. **Sync** — ArgoCD applies the diff (create, update, delete resources)
+6. **Report** — ArgoCD dashboard shows sync status, deploy history, logs
+
+### What ArgoCD gives us for free
+
+- Git webhook / polling
+- State diffing (desired vs actual)
+- Convergence (create, update, delete)
+- Rollback (to any previous git commit)
+- Web dashboard with deploy history
+- RBAC and multi-tenancy
+- SSO integration
+- Notifications (Slack, webhook, email)
+- Preview environments for PRs
+- Health checks and degraded status
+
+---
+
 ## Convergence
 
 ### Dependency Graph
 
 ```
 XMPP client (slixmpp)
-  └── needed by: daemon (approval, presence, messaging)
-        └── needed by: k8s (pod entrypoint)
+  +-- needed by: daemon (approval, presence, messaging)
+        +-- needed by: k8s (pod entrypoint)
 ```
 
 ### Development Phases
 
-**Phase 1 — Local daemon (no XMPP):**
+**Phase 1 -- Local daemon (no XMPP):**
 Agent daemon with local socket only. Portal sends requests. Bootstrap
 loop resolves preconditions. Launches claude-code. Useful immediately
 on signi.
 
-**Phase 2 — XMPP client:**
+**Phase 2 -- XMPP client:**
 Daemon connects to 6bit.com. Presence, messaging, approval over XMPP.
 Human can send tasks from phone. Approval works remotely.
 
-**Phase 3 — Headless sessions:**
+**Phase 3 -- Headless sessions:**
 Agent SDK for fully automated sessions. Daemon streams progress to
 XMPP. No portal needed.
 
-**Phase 4 — K8s deployment:**
+**Phase 4 -- K8s deployment:**
 `nuketown.cloud` options, `toKubeManifests`, OCI image builds. Pod
 runs daemon as entrypoint. Secrets via workload identity. PVCs for
 persistence.
 
-**Phase 5 — ArgoCD:**
+**Phase 5 -- ArgoCD:**
 Config management plugin wraps `toKubeManifests`. Push nuketown nix
 config -> ArgoCD syncs manifests. Full gitops.
+
+**Phase 6 -- Orchestration UX:**
+Resource scaling controller. Idle timeout auto-downscaling. Node pool
+migration (standard -> build -> GPU). Chat-based scaling approval.
+
+**Phase 7 -- Production hardening:**
+Workload identity setup automation. KMS-backed sops. Network policies.
+Cost controls (ResourceQuota, LimitRange, budget alerts). Multi-tenant
+cluster support. Spot/preemptible scheduling for idle agents.
 
 ### Drift Insurance
 
@@ -357,15 +580,65 @@ approval gate ensures all changes go through the front door.
 
 ---
 
-## New Repos
+## Repository Boundaries
 
-| Repo | Role |
-|------|------|
-| **nuketown** (this repo) | Module options, `toKubeManifests`, identity, daemon package |
-| **nuketown-deploy** (new) | ArgoCD plugin, scaling controller, cluster docs |
+| Repo | Role | Scope |
+|------|------|-------|
+| **nuketown** (this repo) | Declares | Module options, `toKubeManifests`, identity, daemon package |
+| **nuketown-deploy** (new) | Reconciles | ArgoCD plugin, scaling controller, cluster docs |
 
-nuketown-chat was originally planned as a separate repo, but since
-the XMPP client lives inside the daemon process and the server is
-managed externally (mynix/liver), there's no need for a standalone
-chat repo. The slixmpp integration is part of the daemon package
-in nuketown.
+nuketown-chat was originally planned as a separate repo, but the
+XMPP client lives inside the daemon process and the server is managed
+externally (mynix/liver). The slixmpp integration is part of the
+daemon package in nuketown.
+
+---
+
+## Open Questions
+
+1. **Image build pipeline.** Where does `dockerTools.buildImage` run?
+   CI (GitHub Actions -> push to registry)? On the cluster (build pod)?
+   Locally (push from dev machine)? CI -> registry is probably the
+   right default.
+
+2. **KMS bootstrap.** Workload identity + KMS solves secrets at runtime.
+   But the cluster operator needs to set up workload identity federation
+   once per cluster. Document this clearly in nuketown-deploy.
+
+3. **Agent networking.** If ada is on your laptop with a serial port and
+   vox is in a cluster, how do they collaborate beyond git? XMPP handles
+   messaging. Shared git remote handles code. Probably sufficient.
+
+4. **Cost controls.** Agents that request scale-ups need guardrails.
+   ResourceQuota per namespace, LimitRange per pod, budget alerts.
+   The scaling controller enforces maximums from `scaling.maxResources`.
+
+5. **Local k3s.** Can you run `nuketown.cloud.enable = true` on the
+   same machine as a local agent? k3s was on signi before the
+   nix-snapshotter patch broke. This could be a nice dev/test path:
+   same config runs locally in k3s before deploying to a real cluster.
+
+---
+
+## Prior Art
+
+| Tool | What it does | Gap |
+|------|-------------|-----|
+| ArgoCD | GitOps reconciliation for k8s | No nix integration, no agent awareness |
+| nix-snapshotter | NixOS closures as container images | No orchestration, no agent lifecycle |
+| NixOps | Nix-native cloud provisioning | VM-based, abandoned |
+| Colmena / deploy-rs | Push NixOS closures over SSH | VM-based, no orchestration |
+| nixos-anywhere | Install NixOS on any machine | VM-based, one-shot |
+| Comin | Pull-based GitOps for NixOS | VM-based, no provisioning |
+| Terraform + k8s | IaC for cluster resources | Two languages, no nix integration |
+
+Nuketown Cloud would be the first tool that:
+- Uses NixOS configuration as the sole source of truth for agent
+  environments *and* their cloud scheduling
+- Translates nix declarations into k8s manifests
+- Treats infrastructure scaling as a conversation between agent and human
+- Provides git-push-to-running-agent as a workflow
+
+---
+
+*The town is disposable. Now it runs anywhere there's a cluster.*

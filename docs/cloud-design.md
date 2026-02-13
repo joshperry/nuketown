@@ -331,6 +331,8 @@ nuketown.agents.<name>.daemon = {
 Generates a systemd user service under the agent account:
 - `ExecStart = nuketown-daemon`
 - `Restart = always`
+- Sets `users.users.${name}.linger = true` so the user manager
+  (and the daemon) starts at boot without requiring a login session
 - Reads identity.toml, repos config, API key from sops
 - Connects to XMPP on startup
 
@@ -405,18 +407,53 @@ picks sensible defaults for everything else.
 
 ### Resource Tiers
 
-Abstract away instance types entirely:
+Tiers are defined in `nuketown.cloud.tiers` by the cluster admin.
+Each tier declares the resources and scheduling constraints for that
+class of workload. `toKubeManifests` uses these definitions to
+generate pod resource requests/limits, node selectors, and
+tolerations.
 
-| Tier | Intent | Rough shape |
-|------|--------|-------------|
-| `small` | Idle / light tasks | 1 vCPU, 2GB RAM |
-| `standard` | Normal development work | 2 vCPU, 4GB RAM |
-| `large` | Builds, compilation | 4 vCPU, 8GB RAM |
-| `gpu` | ML workloads | GPU node pool |
+```nix
+nuketown.cloud.tiers = {
+  small = {
+    cpu = "1";
+    memory = "2Gi";
+    nodeSelector = { "nuketown.io/tier" = "small"; };
+  };
+  standard = {
+    cpu = "2";
+    memory = "4Gi";
+    nodeSelector = { "nuketown.io/tier" = "standard"; };
+  };
+  large = {
+    cpu = "4";
+    memory = "8Gi";
+    nodeSelector = { "nuketown.io/tier" = "large"; };
+  };
+  gpu = {
+    cpu = "4";
+    memory = "16Gi";
+    resources = { "nvidia.com/gpu" = "1"; };
+    nodeSelector = { "nuketown.io/tier" = "gpu"; };
+    tolerations = [
+      { key = "nvidia.com/gpu"; operator = "Exists"; effect = "NoSchedule"; }
+    ];
+  };
+};
+```
 
-The `toKubeManifests` function maps tiers to k8s resource
-requests/limits. Cluster operators configure node pools to satisfy
-them. Users never see instance types.
+The tier definitions are the single source of truth — they describe
+both what the agent needs and where it runs. The cluster admin
+matches these to their infrastructure by labeling node pools with
+`nuketown.io/tier`. Agents just reference a tier name:
+
+```nix
+nuketown.agents.ada.cloud.resources = "standard";
+```
+
+If an agent requests a tier that isn't defined, nix evaluation fails.
+If the tier is defined but no matching node pool exists in the
+cluster, the pod stays unschedulable — k8s reports the reason.
 
 ```nix
 nuketown.cloud = {
@@ -541,6 +578,61 @@ nuketown.agents.ada.cloud.identity = {
   scope = "ada-*";
 };
 ```
+
+### Identity Self-Provisioning
+
+The GitHub PAT is the single root credential per agent. SSH and GPG
+keys are derived from it, not pre-generated.
+
+```
+GitHub PAT (sops)
+  └── agent boot
+        ├── check: ~/.ssh/id_ed25519 exists?
+        │     yes -> done (persisted from previous boot)
+        │     no  -> generate keypair
+        │            -> DELETE stale keys from GitHub (by title match)
+        │            -> POST /user/keys (upload public SSH key)
+        │
+        ├── check: ~/.gnupg/ has signing key?
+        │     yes -> done
+        │     no  -> generate GPG key (from identity.toml: name, email)
+        │            -> DELETE stale GPG keys from GitHub
+        │            -> POST /user/gpg_keys (upload public GPG key)
+        │
+        └── ready (can push signed commits)
+```
+
+**One secret per agent.** The PAT in sops is the only credential the
+human provisions. Everything else — SSH identity, GPG signing, GitHub
+API access — derives from it.
+
+**Persist for performance, re-derive for resilience.** Key directories
+(`~/.ssh`, `~/.gnupg`) are persisted so the agent doesn't re-provision
+on every reboot. But if persistence is lost (disk failure, PVC
+migration, fresh cluster), the agent detects missing keys and
+re-provisions from the PAT on next boot. Stale keys are cleaned up
+from GitHub automatically.
+
+**PAT scopes required:**
+- `repo` — push, open PRs
+- `admin:public_key` — manage SSH keys
+- `admin:gpg_key` — manage GPG keys
+
+```nix
+nuketown.agents.<name>.github = {
+  enable = true;
+  pat = "ada/github-pat";  # sops secret name
+  # SSH/GPG key dirs auto-added to persist
+  # Boot service handles generation + upload
+};
+```
+
+The module generates a systemd oneshot service that runs before the
+daemon, checks for existing keys, and provisions if missing.
+
+For cloud agents, the PAT itself can come from the cloud secret
+store (via workload identity) instead of sops — same self-provisioning
+flow, different root credential source.
 
 ### Identity Projection
 

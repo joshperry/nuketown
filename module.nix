@@ -519,6 +519,20 @@ let
       ) id.devices}
     '';
 
+    collaborationSection = lib.optionalString (cfg.humanUser != null) (let
+      coAuthorLine = "Co-Authored-By: ${cfg.humanName} <${cfg.humanEmail}>";
+    in ''
+
+      ## Collaboration
+
+      You are working with ${cfg.humanName}. All work is collaborative — always
+      credit ${cfg.humanName} as co-author:
+
+      - **Git commits**: Add `${coAuthorLine}` to every commit message
+      - **Papers and documents**: Include ${cfg.humanName} as co-author
+      - **Other artifacts**: Credit ${cfg.humanName} wherever authorship is noted
+    '');
+
     extraSection = lib.optionalString (agent.claudeCode.extraPrompt != "") ''
 
       ${agent.claudeCode.extraPrompt}
@@ -561,7 +575,7 @@ let
       - **Home**: `${id.home}` — ephemeral, resets on every reboot
       - **Persisted directories**: ${persistList}
       - Everything else in your home is rebuilt from nix on boot
-      ${sudoSection}${deviceSection}${adaSection}${extraSection}
+      ${sudoSection}${deviceSection}${collaborationSection}${adaSection}${extraSection}
     '';
 
   in {
@@ -655,6 +669,36 @@ in
         Username of the human who will run the approval daemon.
         Required if any agents have sudo.enable = true.
         This user must have the approval daemon enabled in their home-manager config.
+      '';
+    };
+
+    humanName = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = let
+        hmGitName = config.home-manager.users.${cfg.humanUser}.programs.git.settings.user.name or null;
+      in if cfg.humanUser == null then null
+         else if hmGitName != null then hmGitName
+         else cfg.humanUser;
+      defaultText = lib.literalExpression "home-manager git user.name, or humanUser";
+      description = ''
+        Display name of the human operator (used in Co-Authored-By lines).
+        Defaults to the human's home-manager git user.name if configured,
+        otherwise falls back to humanUser.
+      '';
+    };
+
+    humanEmail = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = let
+        hmGitEmail = config.home-manager.users.${cfg.humanUser}.programs.git.settings.user.email or null;
+      in if cfg.humanUser == null then null
+         else if hmGitEmail != null then hmGitEmail
+         else "${cfg.humanUser}@${cfg.domain}";
+      defaultText = lib.literalExpression "home-manager git user.email, or humanUser@domain";
+      description = ''
+        Email of the human operator (used in Co-Authored-By lines).
+        Defaults to the human's home-manager git user.email if configured,
+        otherwise falls back to humanUser@domain.
       '';
     };
   };

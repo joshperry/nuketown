@@ -6,6 +6,11 @@ secrets/
 result
 result-*
 
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
 # direnv
 .direnv/
 

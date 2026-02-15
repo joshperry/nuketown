@@ -173,6 +173,28 @@ let
     };
   };
 
+  # Agent with XMPP enabled
+  xmppConfig = { pkgs, ... }: {
+    nuketown = {
+      enable = true;
+      domain = "nuketown.test";
+      humanUser = "human";
+      agents.ada = {
+        enable = true;
+        uid = 1100;
+        role = "software";
+        description = "Test XMPP agent";
+        sudo.enable = true;
+        xmpp = {
+          enable = true;
+          jid = "ada@6bit.com";
+          passwordSecret = "ada/xmpp-password";
+          rooms = [ "agents@conference.6bit.com" "dev@conference.6bit.com" ];
+        };
+      };
+    };
+  };
+
   # Agent with daemon enabled
   daemonConfig = { pkgs, ... }: {
     nuketown = {
@@ -204,6 +226,7 @@ let
   noCCCfg = evalConfig noClaudeCodeConfig [];
   customCfg = evalConfig customNamingConfig [];
   daemonCfg = evalConfig daemonConfig [];
+  xmppCfg = evalConfig xmppConfig [];
 
   # Shorthand accessors
   adaHM = fullCfg.home-manager.users.ada;
@@ -217,6 +240,8 @@ let
   botCC = botHM.programs.claude-code;
 
   daemonAdaHM = daemonCfg.home-manager.users.ada;
+
+  xmppAdaHM = xmppCfg.home-manager.users.ada;
 
 in {
 
@@ -520,5 +545,79 @@ in {
     (assertEq "no daemon service when disabled"
       (builtins.hasAttr "nuketown-daemon" adaHM.systemd.user.services) false)
   ];
+
+  # ── XMPP Checks ──────────────────────────────────────────────
+
+  xmpp-config = mkCheck "xmpp-config" (let
+    toml = xmppAdaHM.xdg.configFile."nuketown/xmpp.toml".text;
+  in [
+    (assertContains "xmpp.toml has jid" toml ''jid = "ada@6bit.com"'')
+    (assertContains "xmpp.toml has password_file" toml "password_file = \"/run/secrets/ada/xmpp-password\"")
+    (assertContains "xmpp.toml has rooms" toml ''"agents@conference.6bit.com"'')
+    (assertContains "xmpp.toml has second room" toml ''"dev@conference.6bit.com"'')
+  ]);
+
+  xmpp-secret = mkCheck "xmpp-secret" [
+    (assertEq "sops secret for XMPP password exists"
+      (builtins.hasAttr "ada/xmpp-password" xmppCfg.sops.secrets) true)
+    (assertEq "sops secret owner is ada"
+      xmppCfg.sops.secrets."ada/xmpp-password".owner "ada")
+  ];
+
+  xmpp-disabled = mkCheck "xmpp-disabled" [
+    (assertEq "no xmpp.toml when xmpp disabled"
+      (builtins.hasAttr "nuketown/xmpp.toml" adaHM.xdg.configFile) false)
+  ];
+
+  # ── Approval Daemon XMPP Checks ──────────────────────────────
+
+  broker-xmpp-service = mkCheck "broker-xmpp-service" (let
+    brokerXmppCfg = evalConfig xmppConfig [
+      ({ ... }: {
+        home-manager.users.human = {
+          imports = [ ./approval-daemon.nix ];
+          home.stateVersion = "25.11";
+          nuketown.approvalDaemon = {
+            enable = true;
+            xmpp = {
+              enable = true;
+              jid = "josh@6bit.com";
+              passwordFile = "/run/secrets/josh-xmpp-password";
+            };
+          };
+        };
+      })
+    ];
+    humanHM = brokerXmppCfg.home-manager.users.human;
+    svc = humanHM.systemd.user.services.nuketown-broker-xmpp;
+    execStart = builtins.head svc.Service.ExecStart;
+  in [
+    (assertContains "xmpp broker ExecStart" execStart "nuketown-broker-xmpp")
+    (assertEq "xmpp broker restart" svc.Service.Restart "always")
+    (assertEq "xmpp broker wanted by default.target"
+      svc.Install.WantedBy [ "default.target" ])
+    (assertEq "xmpp broker env has JID"
+      (builtins.any (e: nixpkgs.lib.hasInfix "NUKETOWN_XMPP_JID=josh@6bit.com" e) svc.Service.Environment) true)
+    (assertEq "xmpp broker env has password file"
+      (builtins.any (e: nixpkgs.lib.hasInfix "NUKETOWN_XMPP_PASSWORD_FILE=/run/secrets/josh-xmpp-password" e) svc.Service.Environment) true)
+    (assertEq "xmpp broker env has resource"
+      (builtins.any (e: nixpkgs.lib.hasInfix "NUKETOWN_XMPP_RESOURCE=nuketown-broker" e) svc.Service.Environment) true)
+  ]);
+
+  broker-xmpp-disabled = mkCheck "broker-xmpp-disabled" (let
+    brokerNoCfg = evalConfig fullAgentConfig [
+      ({ ... }: {
+        home-manager.users.human = {
+          imports = [ ./approval-daemon.nix ];
+          home.stateVersion = "25.11";
+          nuketown.approvalDaemon.enable = true;
+        };
+      })
+    ];
+    humanHM = brokerNoCfg.home-manager.users.human;
+  in [
+    (assertEq "no xmpp broker service when disabled"
+      (builtins.hasAttr "nuketown-broker-xmpp" humanHM.systemd.user.services) false)
+  ]);
 
 }

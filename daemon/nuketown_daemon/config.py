@@ -30,6 +30,15 @@ def _default_socket_path() -> Path:
 
 
 @dataclass
+class XMPPConfig:
+    """XMPP connection configuration."""
+
+    jid: str = ""
+    password: str = ""
+    rooms: list[str] = field(default_factory=list)
+
+
+@dataclass
 class DaemonConfig:
     """Complete daemon configuration."""
 
@@ -50,6 +59,9 @@ class DaemonConfig:
 
     # Command to launch in tmux sessions
     agent_command: str = "claude-code"
+
+    # XMPP (None if not configured)
+    xmpp: XMPPConfig | None = None
 
 
 def load_identity(path: Path | None = None) -> dict:
@@ -101,6 +113,45 @@ def discover_repos(projects_dir: Path) -> dict[str, RepoConfig]:
     return repos
 
 
+def load_xmpp_config(path: Path | None = None) -> XMPPConfig | None:
+    """Load xmpp.toml and read password from file.
+
+    Returns None if xmpp.toml doesn't exist or lacks required fields.
+    """
+    if path is None:
+        path = (
+            Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+            / "nuketown"
+            / "xmpp.toml"
+        )
+    if not path.exists():
+        return None
+
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+
+    jid = data.get("jid", "")
+    if not jid:
+        log.warning("xmpp.toml missing 'jid'")
+        return None
+
+    password_file = data.get("password_file", "")
+    password = ""
+    if password_file:
+        pw_path = Path(password_file)
+        if pw_path.exists():
+            password = pw_path.read_text().strip()
+        else:
+            log.warning("XMPP password file not found: %s", password_file)
+            return None
+
+    rooms = data.get("rooms", [])
+    if isinstance(rooms, str):
+        rooms = [rooms]
+
+    return XMPPConfig(jid=jid, password=password, rooms=rooms)
+
+
 def load_config() -> DaemonConfig:
     """Build DaemonConfig from all sources."""
     identity = load_identity()
@@ -122,5 +173,8 @@ def load_config() -> DaemonConfig:
     discovered = discover_repos(projects_dir)
     configured = load_repos_toml()
     cfg.repos = {**discovered, **configured}
+
+    # XMPP config (optional)
+    cfg.xmpp = load_xmpp_config()
 
     return cfg

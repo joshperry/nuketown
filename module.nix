@@ -462,6 +462,28 @@ let
           description = "Timeout in seconds for headless sessions (default 4h)";
         };
       };
+
+      xmpp = {
+        enable = lib.mkEnableOption "XMPP client for this agent";
+
+        jid = lib.mkOption {
+          type = lib.types.str;
+          default = "${name}@${cfg.domain}";
+          description = "XMPP JID for this agent";
+        };
+
+        passwordSecret = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = "sops secret name for XMPP password";
+        };
+
+        rooms = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [];
+          description = "MUC rooms to auto-join on connect";
+        };
+      };
     };
   };
 
@@ -469,6 +491,7 @@ let
   sudoAgents = lib.filterAttrs (_: a: a.enable && a.sudo.enable) cfg.agents;
   claudeCodeAgents = lib.filterAttrs (_: a: a.enable && a.claudeCode.enable) cfg.agents;
   daemonAgents = lib.filterAttrs (_: a: a.enable && a.daemon.enable) cfg.agents;
+  xmppAgents = lib.filterAttrs (_: a: a.enable && a.xmpp.enable) cfg.agents;
 
   # ── Shared Agent Identity ──────────────────────────────────────
   # Single source of truth for agent identity facts.
@@ -934,6 +957,22 @@ in
         };
       }))
 
+      # ── XMPP Integration ──────────────────────────────────────────
+      # Generate xmpp.toml for agents with XMPP enabled.
+      (lib.optionalAttrs agent.xmpp.enable {
+        xdg.configFile."nuketown/xmpp.toml".text = let
+          roomsToml = lib.concatMapStringsSep ", " (r: ''"${r}"'') agent.xmpp.rooms;
+          # sops-nix default path: /run/secrets/<secret-name>
+          passwordPath = if agent.xmpp.passwordSecret != null
+            then "/run/secrets/${agent.xmpp.passwordSecret}"
+            else "/dev/null";
+        in ''
+          jid = "${agent.xmpp.jid}"
+          password_file = "${passwordPath}"
+          rooms = [${roomsToml}]
+        '';
+      })
+
       # ── Daemon Integration ────────────────────────────────────────
       # Generate repos.toml and a systemd user service for the daemon.
       (lib.optionalAttrs agent.daemon.enable {
@@ -1093,6 +1132,12 @@ in
       }) agent.secrets.extraSecrets
       // lib.optionalAttrs (agent.daemon.apiKeySecret != null) {
         "${agent.daemon.apiKeySecret}" = {
+          inherit sopsFile;
+          owner = name;
+        };
+      }
+      // lib.optionalAttrs (agent.xmpp.passwordSecret != null) {
+        "${agent.xmpp.passwordSecret}" = {
           inherit sopsFile;
           owner = name;
         };

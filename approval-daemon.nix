@@ -2,6 +2,7 @@
 
 let
   cfg = config.nuketown.approvalDaemon;
+  xmppCfg = cfg.xmpp;
 
   socketPath = "/run/nuketown-broker/socket";
 
@@ -242,6 +243,194 @@ let
     echo "ERROR: no valid operations"
   '';
 
+  # ── XMPP Broker Client ──────────────────────────────────────
+  # Standalone XMPP client that receives approval stanzas from agents
+  # and shows zenity popups. Runs alongside the socket-based broker as
+  # a parallel notification channel. First response wins.
+  brokerXmppClient = pkgs.writers.writePython3Bin "nuketown-broker-xmpp" {
+    libraries = [ pkgs.python3Packages.slixmpp ];
+    flakeIgnore = [ "E501" "W503" ];
+  } ''
+    """Nuketown XMPP approval broker.
+
+    Connects as the human's JID, advertises urn:nuketown:approval via
+    service discovery, receives approval request stanzas from agents,
+    shows zenity popups, and sends responses back.
+    """
+    import asyncio
+    import logging
+    import os
+    import sys
+    import uuid
+
+    import slixmpp
+    from slixmpp.xmlstream import ElementBase, register_stanza_plugin
+    from slixmpp.xmlstream.handler import Callback
+    from slixmpp.xmlstream.matcher import MatchXPath
+
+    NAMESPACE = "urn:nuketown:approval"
+    ZENITY = "${pkgs.zenity}/bin/zenity"
+    DEFAULT_TIMEOUT = 120
+
+    log = logging.getLogger("nuketown.broker.xmpp")
+
+
+    # ── Custom Stanza Elements ──────────────────────────────────
+
+    class ApprovalRequest(ElementBase):
+        """Approval request stanza element."""
+        name = "approval"
+        namespace = NAMESPACE
+        plugin_attrib = "approval"
+        interfaces = {"id", "agent", "kind", "command", "timeout"}
+        sub_interfaces = {"agent", "kind", "command", "timeout"}
+
+
+    class ApprovalResponse(ElementBase):
+        """Approval response stanza element."""
+        name = "approval-response"
+        namespace = NAMESPACE
+        plugin_attrib = "approval_response"
+        interfaces = {"id", "result"}
+        sub_interfaces = {"result"}
+
+
+    # ── Broker Bot ──────────────────────────────────────────────
+
+    class ApprovalBroker(slixmpp.ClientXMPP):
+        """XMPP client that handles approval requests via zenity."""
+
+        def __init__(self, jid, password, resource="nuketown-broker"):
+            full_jid = f"{jid}/{resource}"
+            super().__init__(full_jid, password)
+
+            self.register_plugin("xep_0030")  # Service discovery
+            self.register_plugin("xep_0199")  # Ping
+
+            register_stanza_plugin(slixmpp.Message, ApprovalRequest)
+            register_stanza_plugin(slixmpp.Message, ApprovalResponse)
+
+            self.add_event_handler("session_start", self.on_session_start)
+
+            self.register_handler(
+                Callback(
+                    "Approval Request",
+                    MatchXPath(f"{{jabber:client}}message/{{{NAMESPACE}}}approval"),
+                    self._handle_approval,
+                )
+            )
+
+        async def on_session_start(self, event):
+            await self.get_roster()
+            self.send_presence()
+
+            # Advertise the approval feature via disco
+            self["xep_0030"].add_feature(NAMESPACE)
+            log.info("Session started, advertising %s", NAMESPACE)
+
+        def _handle_approval(self, msg):
+            """Dispatch approval request to async handler."""
+            asyncio.ensure_future(self._process_approval(msg))
+
+        async def _process_approval(self, msg):
+            """Show zenity popup and send response."""
+            approval = msg["approval"]
+            req_id = approval["id"] or str(uuid.uuid4())[:8]
+            agent = approval["agent"] or "unknown"
+            kind = approval["kind"] or "unknown"
+            command = approval["command"] or ""
+            try:
+                timeout = int(approval["timeout"] or DEFAULT_TIMEOUT)
+            except (ValueError, TypeError):
+                timeout = DEFAULT_TIMEOUT
+
+            log.info(
+                "Approval request %s from %s: %s %s",
+                req_id, agent, kind, command,
+            )
+
+            # Build zenity command
+            if kind == "sudo":
+                text = (
+                    f"Agent <b>{agent}</b> wants to run:\\n\\n"
+                    f"<tt>{command}</tt>\\n\\n"
+                    f"Approve?"
+                )
+                title = f"Nuketown: {agent} ({kind})"
+            else:
+                text = (
+                    f"Agent <b>{agent}</b> requests <b>{kind}</b>:\\n\\n"
+                    f"<tt>{command}</tt>\\n\\n"
+                    f"Approve?"
+                )
+                title = f"Nuketown: {agent} ({kind})"
+
+            try:
+                proc = await asyncio.wait_for(
+                    asyncio.create_subprocess_exec(
+                        ZENITY,
+                        "--question",
+                        f"--title={title}",
+                        f"--text={text}",
+                        "--ok-label=Approve",
+                        "--cancel-label=Deny",
+                        "--default-cancel",
+                        "--width=500",
+                        env={**os.environ, "DISPLAY": os.environ.get("DISPLAY", ":0")},
+                    ),
+                    timeout=5,
+                )
+                rc = await asyncio.wait_for(proc.wait(), timeout=timeout)
+                result = "approved" if rc == 0 else "denied"
+            except asyncio.TimeoutError:
+                result = "denied"
+                log.warning("Approval request %s timed out", req_id)
+            except Exception as e:
+                result = "denied"
+                log.error("Zenity failed for request %s: %s", req_id, e)
+
+            log.info("Approval request %s: %s", req_id, result)
+
+            # Send response back to the requesting agent
+            resp = self.make_message(mto=msg["from"], mtype="normal")
+            resp["approval_response"]["id"] = req_id
+            resp["approval_response"]["result"] = result
+            resp.send()
+
+
+    def main():
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        )
+
+        jid = os.environ.get("NUKETOWN_XMPP_JID")
+        password_file = os.environ.get("NUKETOWN_XMPP_PASSWORD_FILE")
+        resource = os.environ.get("NUKETOWN_XMPP_RESOURCE", "nuketown-broker")
+
+        if not jid:
+            log.error("NUKETOWN_XMPP_JID not set")
+            sys.exit(1)
+        if not password_file:
+            log.error("NUKETOWN_XMPP_PASSWORD_FILE not set")
+            sys.exit(1)
+
+        try:
+            with open(password_file) as f:
+                password = f.read().strip()
+        except FileNotFoundError:
+            log.error("Password file not found: %s", password_file)
+            sys.exit(1)
+
+        bot = ApprovalBroker(jid, password, resource)
+        bot.connect()
+        bot.process(forever=True)
+
+
+    if __name__ == "__main__":
+        main()
+  '';
+
   brokerDaemon = pkgs.writeShellScript "nuketown-broker-daemon" ''
     set -euo pipefail
 
@@ -260,6 +449,26 @@ in
 {
   options.nuketown.approvalDaemon = {
     enable = lib.mkEnableOption "Nuketown operation broker";
+
+    xmpp = {
+      enable = lib.mkEnableOption "XMPP client for the approval broker";
+
+      jid = lib.mkOption {
+        type = lib.types.str;
+        description = "Human's XMPP JID (e.g. josh@6bit.com)";
+      };
+
+      resource = lib.mkOption {
+        type = lib.types.str;
+        default = "nuketown-broker";
+        description = "XMPP resource identifier for the broker session";
+      };
+
+      passwordFile = lib.mkOption {
+        type = lib.types.path;
+        description = "Path to file containing the XMPP password";
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -275,6 +484,30 @@ in
         Restart = "always";
         RestartSec = 5;
         Environment = "DISPLAY=:0";
+      };
+
+      Install = {
+        WantedBy = [ "default.target" ];
+      };
+    };
+
+    systemd.user.services.nuketown-broker-xmpp = lib.mkIf xmppCfg.enable {
+      Unit = {
+        Description = "Nuketown XMPP approval broker";
+        After = [ "graphical-session.target" "nuketown-broker.service" ];
+      };
+
+      Service = {
+        Type = "simple";
+        ExecStart = "${brokerXmppClient}/bin/nuketown-broker-xmpp";
+        Restart = "always";
+        RestartSec = 10;
+        Environment = [
+          "DISPLAY=:0"
+          "NUKETOWN_XMPP_JID=${xmppCfg.jid}"
+          "NUKETOWN_XMPP_PASSWORD_FILE=${xmppCfg.passwordFile}"
+          "NUKETOWN_XMPP_RESOURCE=${xmppCfg.resource}"
+        ];
       };
 
       Install = {

@@ -430,6 +430,8 @@ let
 
         package = lib.mkOption {
           type = lib.types.package;
+          default = pkgs.callPackage ./daemon.nix {};
+          defaultText = lib.literalExpression "pkgs.callPackage ./daemon.nix {}";
           description = "Nuketown daemon package";
         };
 
@@ -998,7 +1000,7 @@ in
                 "NUKETOWN_HEADLESS_TIMEOUT=${toString agent.daemon.headlessTimeout}"
               ]
               (lib.mkIf (agent.daemon.apiKeySecret != null) [
-                "ANTHROPIC_API_KEY_FILE=%d/anthropic-api-key"
+                "ANTHROPIC_API_KEY_FILE=/run/secrets/${agent.daemon.apiKeySecret}"
               ])
             ];
           };

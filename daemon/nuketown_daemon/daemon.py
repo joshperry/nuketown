@@ -11,6 +11,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from .bootstrap import BootstrapError, resolve_workspace
@@ -32,6 +33,9 @@ class TaskRequest:
     project: str
     prompt: str = ""
     branch: str = ""
+    mode: str = ""  # "interactive", "headless", or "" (auto)
+    source: str = ""  # "socket" or "xmpp"
+    reply_to: str = ""  # JID to send completion summary to
 
 
 @dataclass
@@ -110,8 +114,11 @@ class Daemon:
         """Handle an incoming XMPP message as a task request."""
         req_type = data.get("type")
         if req_type == "task":
+            # Tag with source so mode selection works
+            data.setdefault("source", "xmpp")
+            data.setdefault("reply_to", data.get("from", ""))
             result = await self._handle_task(data)
-            # Send response back via XMPP if we have a from JID
+            # Send acceptance/queued response back via XMPP
             from_jid = data.get("from")
             if from_jid and self._xmpp_client:
                 import json
@@ -162,6 +169,9 @@ class Daemon:
             project=project,
             prompt=request.get("prompt", ""),
             branch=request.get("branch", ""),
+            mode=request.get("mode", ""),
+            source=request.get("source", "socket"),
+            reply_to=request.get("reply_to", ""),
         )
 
         if self._state.state == State.WORKING:
@@ -184,22 +194,49 @@ class Daemon:
         if self._presence:
             self._presence.update(state.value, detail)
 
+    def _select_mode(self, task: TaskRequest) -> str:
+        """Choose interactive vs headless based on request.
+
+        - Explicit mode in request takes precedence
+        - XMPP source defaults to headless
+        - Socket source defaults to interactive
+        """
+        if task.mode in ("interactive", "headless"):
+            return task.mode
+        if task.source == "xmpp":
+            return "headless"
+        return "interactive"
+
     async def _process_task(self, task: TaskRequest) -> None:
-        """Process a single task: bootstrap workspace, launch session."""
+        """Process a single task: bootstrap workspace, choose mode, run."""
+        summary = ""
         try:
             path = await resolve_workspace(self.cfg, task.project, task.branch)
-            await launch_session(
-                self.cfg.agent_name,
-                path,
-                command=self.cfg.agent_command,
-                prompt=task.prompt,
-            )
-            log.info("task completed: %s", task.project)
+            mode = self._select_mode(task)
+            log.info("processing task %s in %s mode", task.project, mode)
+
+            if mode == "headless":
+                summary = await self._run_headless(task, path)
+            else:
+                await launch_session(
+                    self.cfg.agent_name,
+                    path,
+                    command=self.cfg.agent_command,
+                    prompt=task.prompt,
+                )
+                summary = f"Interactive session launched for {task.project}"
+
+            log.info("task completed: %s (%s)", task.project, mode)
         except BootstrapError as exc:
+            summary = f"Bootstrap failed: {exc}"
             log.error("bootstrap failed for %s: %s", task.project, exc)
         except Exception:
+            summary = "Unexpected error processing task"
             log.exception("unexpected error processing task %s", task.project)
         finally:
+            # Send completion summary via XMPP if requested
+            if task.reply_to and self._xmpp_client and summary:
+                self._xmpp_client.send_message(task.reply_to, summary)
             self._state.current = None
             # Process next queued task
             if self._state.queue:
@@ -209,3 +246,25 @@ class Daemon:
                 self._worker_task = asyncio.create_task(self._process_task(next_task))
             else:
                 self._set_state(State.IDLE)
+
+    async def _run_headless(self, task: TaskRequest, workspace: Path) -> str:
+        """Run a headless API session for the task."""
+        from .headless import HeadlessSession
+
+        progress_cb = None
+        if task.reply_to and self._xmpp_client:
+            reply_jid = task.reply_to
+            xmpp = self._xmpp_client
+
+            async def progress_cb(event: str, detail: str = "") -> None:
+                xmpp.send_message(reply_jid, f"[{event}] {detail}")
+
+        model = self.cfg.headless_model or None  # None = use default
+        session = HeadlessSession(
+            workspace=workspace,
+            agent_name=self.cfg.agent_name,
+            model=model,
+            timeout=self.cfg.headless_timeout,
+            progress_callback=progress_cb,
+        )
+        return await session.run(task.prompt or f"Work on {task.project}")

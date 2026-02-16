@@ -60,6 +60,10 @@ class DaemonConfig:
     # Command to launch in tmux sessions
     agent_command: str = "claude-code"
 
+    # Headless session settings
+    headless_timeout: int = 14400  # 4 hours
+    headless_model: str = ""  # empty = use default
+
     # XMPP (None if not configured)
     xmpp: XMPPConfig | None = None
 
@@ -159,6 +163,9 @@ def load_config() -> DaemonConfig:
     home = Path(identity.get("home", str(Path.home())))
     projects_dir = home / "projects"
 
+    headless_timeout = int(os.environ.get("NUKETOWN_HEADLESS_TIMEOUT", "14400"))
+    headless_model = os.environ.get("NUKETOWN_HEADLESS_MODEL", "")
+
     cfg = DaemonConfig(
         agent_name=identity.get("name", os.environ.get("USER", "agent")),
         role=identity.get("role", ""),
@@ -167,6 +174,8 @@ def load_config() -> DaemonConfig:
         home=str(home),
         uid=identity.get("uid", os.getuid()),
         projects_dir=projects_dir,
+        headless_timeout=headless_timeout,
+        headless_model=headless_model,
     )
 
     # Merge repos: toml entries take precedence over discovered

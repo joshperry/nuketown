@@ -9,7 +9,10 @@ python3Packages.buildPythonApplication {
 
   build-system = [ python3Packages.setuptools ];
 
-  propagatedBuildInputs = [ python3Packages.slixmpp ];
+  propagatedBuildInputs = [
+    python3Packages.anthropic
+    python3Packages.slixmpp
+  ];
 
   nativeBuildInputs = [ makeWrapper ];
 

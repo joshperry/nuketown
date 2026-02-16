@@ -1,18 +1,199 @@
-# Cloud Agent Design
+# Nuketown Agent Architecture
 
-**One-liner:** Define an AI agent in Nix. Push to main. It's running in the cloud.
+**One-liner:** Define an agent in Nix. Deploy it anywhere — your
+workstation, your servers, the cloud.
 
-This document describes the architecture for running nuketown agents
-remotely — outside the human's physical workstation — while preserving
-the identity, auditability, and approval guarantees of the local model.
+Nuketown agents run as real Unix users on real machines. This document
+describes the three deployment models, the shared infrastructure that
+connects them, and the cloud deployment architecture.
 
-Three work streams converge to make this possible:
+---
 
-1. **XMPP** — communication and approval transport
-2. **Agent daemon** — bootstrap orchestrator with Claude API loop
-3. **K8s pods** — deployment target for cloud agents
+## Deployment Models
 
-Each is independently useful and can be developed in parallel.
+Nuketown agents fall into three categories based on where they run and
+what they do. All share the same framework — the difference is which
+subsystems activate.
+
+### Workstation Agent
+
+**Identity is the collaborator.** The workstation agent is the human's
+daily partner. It works on code, manages the machine's configuration,
+and interacts side-by-side through the portal. There's typically one
+per workstation — wherever the human physically sits.
+
+```nix
+# signi (josh's desktop)
+nuketown.agents.ada = {
+  role = "software";
+  description = ''
+    Software collaborator on signi. Works with josh on embedded
+    systems, NixOS configuration, and web projects.
+  '';
+  portal.enable = true;       # tmux side-by-side
+  sudo.enable = true;         # zenity approval (human is right there)
+  daemon.enable = true;       # socket + XMPP + headless
+  xmpp.enable = true;         # ada@6bit.com
+  devices = [ /* STM32, etc */ ];
+  persist = [ "projects" ".config/claude" ];
+};
+```
+
+Ada is special because she bridges both roles — software collaborator
+AND machine expert. You ask her about a refactor AND about why the
+udev rules aren't working. There's no separate "signi" identity because
+the human is co-located. Splitting them would be like having a coworker
+who sits next to you but insists you email a different department to
+adjust the thermostat.
+
+**What activates:** Everything. Portal, device ACLs, ephemeral homes
+(btrfs rollback), zenity approval, daemon with interactive + headless
+modes, XMPP presence.
+
+### Device Agent
+
+**Identity is the machine.** Each managed device gets its own agent
+that knows its hardware, services, and configuration. You chat with the
+device about itself. The agent IS the server, the gateway, the printer.
+
+```nix
+# liver (XMPP/mail server on Hetzner)
+nuketown.agents.liver = {
+  role = "server";
+  description = ''
+    Prosody XMPP server, dovecot mail, DNS for 6bit.com.
+    Runs on Hetzner VPS. NixOS managed via mynix flake.
+  '';
+  daemon.enable = true;
+  xmpp.enable = true;         # liver@6bit.com
+  sudo = {
+    enable = true;
+    preApproved = [            # routine ops, no interactive approval
+      "systemctl restart *"
+      "journalctl *"
+      "certbot renew"
+    ];
+  };
+};
+
+# gateway (home network router)
+nuketown.agents.gateway = {
+  role = "network";
+  description = ''
+    Home network gateway. WireGuard tunnels, nftables firewall,
+    DHCP/DNS for local network.
+  '';
+  daemon.enable = true;
+  xmpp.enable = true;         # gateway@6bit.com
+};
+
+# printer (Raspberry Pi with 3D printer)
+nuketown.agents.printer = {
+  role = "fabrication";
+  description = ''
+    Raspberry Pi running Klipper for the Ender 3.
+    Manages print jobs, monitors temperatures, detects failures.
+  '';
+  daemon.enable = true;
+  xmpp.enable = true;         # printer@6bit.com
+  devices = [
+    { subsystem = "tty"; attrs = { idVendor = "1a86"; }; }  # printer serial
+  ];
+};
+```
+
+You DM `liver@6bit.com`: "Is the Prosody TLS cert still valid?" It
+runs `openssl s_client`, reports back. "Renew it." It runs certbot,
+restarts Prosody, confirms.
+
+You DM `printer@6bit.com`: "What's the print status?" It checks
+Klipper's API, reports bed temp, progress percentage, estimated time.
+
+**What activates:** Daemon (headless-only), XMPP, persistent home
+(no btrfs rollback — servers need state across reboots), scoped sudo
+with pre-approved commands for routine operations. No portal, no zenity
+(no desktop). Approval for non-routine operations flows through XMPP.
+
+**What doesn't:** Portal (no one sitting there), ephemeral homes
+(servers need persistence), device ACLs (usually — except things like
+the printer's serial port).
+
+### Cloud Agent
+
+**Identity is the role.** Cloud agents don't care what hardware
+they're on — the infrastructure is an API call away. You talk to them
+about their work, not about the VM or pod they're executing in.
+
+```nix
+nuketown.agents.ada = {
+  # Same ada, but cloud-deployed for a specific task
+  cloud = {
+    enable = true;
+    resources = "standard";
+    scaling.maxResources = "large";
+  };
+};
+```
+
+When you chat with a cloud agent, you're talking about orchestrating
+resources, not managing a specific machine. "I need a GPU for this
+build" is a resource request, not a sysadmin task. The approval system
+gates scaling, the infrastructure is fungible.
+
+**What activates:** Daemon (headless), XMPP, cloud resource management,
+workload identity for secrets. Pod restart = clean slate (same semantics
+as btrfs rollback, different mechanism).
+
+**What doesn't:** Portal, device ACLs, zenity, btrfs. Hardware is
+abstract.
+
+### Comparison
+
+| | Workstation | Device | Cloud |
+|---|---|---|---|
+| **Identity** | collaborator | the machine | the role |
+| **Example** | ada on signi | liver, gateway, printer | ada in k8s |
+| **Hardware** | fixed, known, hands-on | fixed, known, remote | fungible, requested |
+| **You ask about** | code AND the machine | the machine itself | the work |
+| **Home** | ephemeral (btrfs) | persistent | ephemeral (pod restart) |
+| **Approval** | zenity + XMPP | XMPP + pre-approved | XMPP |
+| **Portal** | yes | no | no |
+| **Scaling** | N/A | N/A | resource tiers |
+| **Count** | 1-2 (where you sit) | 1 per device | many, role-based |
+
+### What They Share
+
+All three models use the same `nuketown.agents` options. The daemon,
+XMPP, identity (keys, git config, TOML), and approval stanzas are
+shared infrastructure. The deployment model is determined by which
+options you enable, not by a separate module.
+
+Your XMPP roster becomes your infrastructure dashboard — collaborators,
+servers, devices, cloud workers. You just chat with them.
+
+```
+Contacts:
+  ada@6bit.com        ● Working: nuketown refactor
+  liver@6bit.com      ● Ready
+  gateway@6bit.com    ● Ready
+  printer@6bit.com    ○ Offline
+```
+
+---
+
+## Cloud Deployment
+
+**One-liner:** Define a cloud agent in Nix. Push to main. It's running.
+
+This section describes the architecture for running nuketown agents in
+the cloud — Kubernetes pods with the same identity, auditability, and
+approval guarantees as local agents.
+
+Three work streams converge:
+
+1. **XMPP** — communication and approval transport (shared with device agents)
+2. **Agent daemon** — bootstrap + headless sessions (shared with device agents)
+3. **K8s pods** — scheduling, scaling, persistence (cloud-specific)
 
 ### The Vercel analogy
 
@@ -41,7 +222,9 @@ Kubernetes replaces VM lifecycle management with one API:
 
 ---
 
-## 1. XMPP Integration
+## XMPP Integration
+
+*Shared infrastructure — serves workstation, device, and cloud agents.*
 
 ### Existing Infrastructure
 
@@ -220,13 +403,25 @@ Agent presence maps to XMPP show states:
 | Blocked | `away` | Waiting for sudo approval |
 | Offline | --- | Daemon not running |
 
-The human sees agent status in their regular XMPP client.
+The human sees all agents — collaborators, servers, devices, cloud
+workers — in their regular XMPP client. The roster IS the
+infrastructure dashboard:
+
+```
+ada@6bit.com          ● Working: nuketown Phase 3
+liver@6bit.com        ● Ready
+gateway@6bit.com      ● Ready
+printer@6bit.com      ○ Offline
+```
 
 ### Agent-to-Agent
 
 Agents message each other directly via JID or through MUC rooms.
 Room provisioning is a server-side concern (mynix/liver config).
 Nuketown agents auto-join configured rooms on connect.
+
+Device agents and cloud agents can coordinate — liver can tell ada
+about a Prosody issue, ada can push a fix and tell liver to deploy it.
 
 ### Client Library
 
@@ -236,7 +431,9 @@ event loop as the agent daemon — no IPC needed.
 
 ---
 
-## 2. Agent Daemon
+## Agent Daemon
+
+*Shared infrastructure — runs on every agent regardless of deployment model.*
 
 The daemon is the single long-running process per agent. It combines
 the XMPP client, the Claude API bootstrap loop, and session management
@@ -338,7 +535,9 @@ Generates a systemd user service under the agent account:
 
 ---
 
-## 3. K8s Pod Deployment
+## K8s Pod Deployment
+
+*Cloud-specific — scheduling, persistence, and secrets for cloud agents.*
 
 ### The NixOS config is the cloud API
 
@@ -732,18 +931,23 @@ XMPP client (slixmpp)
 
 ### Development Phases
 
-**Phase 1 -- Local daemon (no XMPP):**
+**Phase 1 -- Local daemon (no XMPP):** DONE
 Agent daemon with local socket only. Portal sends requests. Bootstrap
 loop resolves preconditions. Launches claude-code. Useful immediately
 on signi.
 
-**Phase 2 -- XMPP client:**
+**Phase 2 -- XMPP client:** DONE
 Daemon connects to 6bit.com. Presence, messaging, approval over XMPP.
 Human can send tasks from phone. Approval works remotely.
 
-**Phase 3 -- Headless sessions:**
-Agent SDK for fully automated sessions. Daemon streams progress to
-XMPP. No portal needed.
+**Phase 3 -- Headless sessions:** DONE
+Anthropic API agent loop for fully automated sessions. Daemon streams
+progress to XMPP. No portal needed. Enables device agents.
+
+**Phase 3.5 -- Device agent deployment:**
+Deploy daemon to managed NixOS machines (liver, gateway, etc.).
+Pre-approved sudo commands for routine ops. XMPP identity per device.
+First real test of the "chat with your infrastructure" model.
 
 **Phase 4 -- K8s deployment:**
 `nuketown.cloud` options, `toKubeManifests`, OCI image builds. Pod
@@ -833,4 +1037,5 @@ Nuketown Cloud would be the first tool that:
 
 ---
 
-*The town is disposable. Now it runs anywhere there's a cluster.*
+*The town is disposable. The agents run everywhere — your desk, your
+servers, the cloud. You just chat with them.*

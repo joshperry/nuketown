@@ -390,12 +390,13 @@ class Daemon:
             async def progress_cb(event: str, detail: str = "") -> None:
                 xmpp.send_message(reply_jid, f"[{event}] {detail}")
 
-        model = self.cfg.headless_model or None  # None = use default
-        session = HeadlessSession(
+        kwargs: dict = dict(
             workspace=workspace,
             agent_name=self.cfg.agent_name,
-            model=model,
             timeout=self.cfg.headless_timeout,
             progress_callback=progress_cb,
         )
+        if self.cfg.headless_model:
+            kwargs["model"] = self.cfg.headless_model
+        session = HeadlessSession(**kwargs)
         return await session.run(task.prompt or f"Work on {task.project}")

@@ -278,6 +278,8 @@ class MailWatcher:
                 notification = await self._fetch_notification(uid)
                 if notification and self._callback:
                     await self._callback(notification)
+                # Mark as seen so we don't reprocess on next connect
+                await self._client.uid("store", uid, "+FLAGS (\\Seen)")
             except Exception:
                 log.exception("error processing unseen mail UID %s", uid)
 
@@ -303,6 +305,8 @@ class MailWatcher:
                 notification = await self._fetch_notification(uid)
                 if notification and self._callback:
                     await self._callback(notification)
+                # Mark as seen so unseen processing doesn't reprocess
+                await self._client.uid("store", uid, "+FLAGS (\\Seen)")
                 max_uid = max(max_uid, int(uid))
             except Exception:
                 log.exception("error processing mail UID %s", uid)
@@ -332,10 +336,11 @@ class MailWatcher:
             return None
 
         # Extract header bytes from response
+        # aioimaplib returns the header data as a bytearray (not bytes)
         raw_headers = b""
         for line in header_resp.lines:
-            if isinstance(line, bytes):
-                raw_headers += line + b"\n"
+            if isinstance(line, (bytes, bytearray)):
+                raw_headers += bytes(line) + b"\n"
 
         if not raw_headers:
             return None
@@ -353,8 +358,8 @@ class MailWatcher:
         if body_resp.result == "OK":
             body_bytes = b""
             for line in body_resp.lines:
-                if isinstance(line, bytes):
-                    body_bytes += line + b"\n"
+                if isinstance(line, (bytes, bytearray)):
+                    body_bytes += bytes(line) + b"\n"
             if body_bytes:
                 try:
                     snippet = body_bytes.decode("utf-8", errors="replace")[:200]

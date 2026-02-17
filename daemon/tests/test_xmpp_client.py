@@ -23,9 +23,10 @@ def client():
         mock_disco = MagicMock()
         mock_muc = MagicMock()
         mock_muc.join_muc = AsyncMock()
+        mock_ping = MagicMock()
         mock_mam = MagicMock()
 
-        plugins = {"xep_0030": mock_disco, "xep_0045": mock_muc, "xep_0313": mock_mam}
+        plugins = {"xep_0030": mock_disco, "xep_0045": mock_muc, "xep_0199": mock_ping, "xep_0313": mock_mam}
         mock_xmpp.__getitem__ = MagicMock(side_effect=lambda key: plugins[key])
 
         # Track registered event handlers

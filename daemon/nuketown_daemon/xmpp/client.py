@@ -57,10 +57,12 @@ class AgentXMPPClient:
         # Register plugins
         self._xmpp.register_plugin("xep_0030")  # Service Discovery
         self._xmpp.register_plugin("xep_0045")  # MUC
+        self._xmpp.register_plugin("xep_0199")  # XMPP Ping (keepalive)
         self._xmpp.register_plugin("xep_0313")  # MAM
 
         self._connected = asyncio.Event()
         self._disconnected_event = asyncio.Event()
+        self._stopping = False
 
     @property
     def connected(self) -> bool:
@@ -73,6 +75,9 @@ class AgentXMPPClient:
 
         # Send initial presence
         self._xmpp.send_presence()
+
+        # Enable keepalive pings (detect dead connections)
+        self._xmpp["xep_0199"].enable_keepalive(interval=300, timeout=30)
 
         # Advertise approval namespace via service discovery
         self._xmpp["xep_0030"].add_feature(APPROVAL_NS)
@@ -118,10 +123,27 @@ class AgentXMPPClient:
             await self._message_callback(data)
 
     def _on_disconnected(self, _event: Any) -> None:
-        """Handle XMPP disconnection."""
+        """Handle XMPP disconnection and schedule reconnect."""
         log.warning("XMPP disconnected: %s", self.jid)
         self._connected.clear()
         self._disconnected_event.set()
+        if not self._stopping:
+            asyncio.ensure_future(self._reconnect())
+
+    async def _reconnect(self, delay: float = 5, max_delay: float = 300) -> None:
+        """Reconnect with exponential backoff."""
+        current_delay = delay
+        while not self._stopping:
+            log.info("reconnecting in %.0fs...", current_delay)
+            await asyncio.sleep(current_delay)
+            if self._stopping:
+                break
+            log.info("reconnecting to XMPP as %s", self.jid)
+            self._xmpp.connect()
+            if await self.wait_connected(timeout=30):
+                log.info("XMPP reconnected: %s", self.jid)
+                return
+            current_delay = min(current_delay * 2, max_delay)
 
     async def connect_and_run(self) -> None:
         """Connect to the XMPP server and process events.
@@ -129,6 +151,7 @@ class AgentXMPPClient:
         This integrates with the existing asyncio event loop —
         slixmpp runs its own processing within the loop.
         """
+        self._stopping = False
         log.info("connecting to XMPP as %s", self.jid)
         self._xmpp.connect()
 
@@ -143,6 +166,7 @@ class AgentXMPPClient:
 
     async def disconnect(self) -> None:
         """Disconnect from the XMPP server cleanly."""
+        self._stopping = True
         log.info("disconnecting XMPP: %s", self.jid)
         self._xmpp.disconnect()
 

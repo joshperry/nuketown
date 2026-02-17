@@ -1090,7 +1090,7 @@ in
       portalAgents = lib.filterAttrs (_: a: a.enable && a.portal.enable) cfg.agents;
     in lib.mkIf (cfg.humanUser != null && portalAgents != {}) ''
       polkit.addRule(function(action, subject) {
-        if (action.id === "org.freedesktop.machine1.shell" &&
+        if (action.id === "org.freedesktop.machine1.host-shell" &&
             subject.user === "${cfg.humanUser}") {
           return polkit.Result.YES;
         }

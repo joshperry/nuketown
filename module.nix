@@ -807,7 +807,7 @@ in
               path="$1"
               shift
               session=$(basename "$path")
-              exec sudo /run/current-system/sw/bin/machinectl shell ${name}@ ${pkgs.bash}/bin/bash -l -c "mkdir -p '$path' && cd '$path' && TMUX= exec ${pkgs.tmux}/bin/tmux -L portal-${name} new-session -As '$session' \\; set -g status off \\; send-keys '${agent.portal.command} $*' C-m"
+              exec /run/current-system/sw/bin/machinectl shell ${name}@ ${pkgs.bash}/bin/bash -l -c "mkdir -p '$path' && cd '$path' && TMUX= exec ${pkgs.tmux}/bin/tmux -L portal-${name} new-session -As '$session' \\; set -g status off \\; send-keys '${agent.portal.command} $*' C-m"
             '';
           in
           pkgs.writeShellScriptBin "portal-${name}" ''
@@ -1055,7 +1055,6 @@ in
 
     # Allow agents to run the approval wrapper via sudo without a password.
     # The wrapper itself gates execution behind the zenity approval dialog.
-    # Also allow the human to use machinectl for portal access.
     security.sudo.extraRules =
       lib.concatLists (lib.mapAttrsToList (name: agent:
         lib.optional agent.sudo.enable {
@@ -1079,16 +1078,24 @@ in
             }) agent.sudo.commands;
         }
       ) enabledAgents)
-      # machinectl NOPASSWD for the human when portals are enabled
-      ++ (let
-        portalAgents = lib.filterAttrs (_: a: a.enable && a.portal.enable) cfg.agents;
-      in lib.optionals (cfg.humanUser != null && portalAgents != {}) [{
-        users = [ cfg.humanUser ];
-        commands = [{
-          command = "/run/current-system/sw/bin/machinectl shell *";
-          options = [ "NOPASSWD" ];
-        }];
-      }]);
+      # machinectl sudo rule removed — polkit handles authorization
+      # (see security.polkit.extraConfig below)
+      ;
+
+    # Polkit rule: allow the human to use machinectl shell for portal access.
+    # Using polkit instead of sudo because machinectl talks to machined over
+    # D-Bus, so it works even when NoNewPrivileges is set in the process tree
+    # (common in sandboxed terminals and systemd scopes).
+    security.polkit.extraConfig = let
+      portalAgents = lib.filterAttrs (_: a: a.enable && a.portal.enable) cfg.agents;
+    in lib.mkIf (cfg.humanUser != null && portalAgents != {}) ''
+      polkit.addRule(function(action, subject) {
+        if (action.id === "org.freedesktop.machine1.shell" &&
+            subject.user === "${cfg.humanUser}") {
+          return polkit.Result.YES;
+        }
+      });
+    '';
 
     # Socket directory for the broker
     # Only the human (owner) and agents in nuketown-broker group can access

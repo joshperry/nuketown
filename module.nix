@@ -424,12 +424,110 @@ let
           '';
         };
       };
+
+      daemon = {
+        enable = lib.mkEnableOption "Nuketown agent daemon";
+
+        package = lib.mkOption {
+          type = lib.types.package;
+          default = pkgs.callPackage ./daemon.nix {};
+          defaultText = lib.literalExpression "pkgs.callPackage ./daemon.nix {}";
+          description = "Nuketown daemon package";
+        };
+
+        bootstrapModel = lib.mkOption {
+          type = lib.types.str;
+          default = "claude-haiku-4-5-20251001";
+          description = "Model for LLM bootstrap fallback";
+        };
+
+        apiKeySecret = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = "sops secret name for Anthropic API key";
+        };
+
+        repos = lib.mkOption {
+          type = lib.types.attrsOf (lib.types.submodule {
+            options.url = lib.mkOption {
+              type = lib.types.str;
+              description = "Git remote URL";
+            };
+          });
+          default = {};
+          description = "Known git remotes for workspace bootstrap";
+        };
+
+        headlessTimeout = lib.mkOption {
+          type = lib.types.int;
+          default = 14400;
+          description = "Timeout in seconds for headless sessions (default 4h)";
+        };
+
+        mail = {
+          enable = lib.mkEnableOption "IMAP IDLE mail watcher in the daemon";
+
+          host = lib.mkOption {
+            type = lib.types.str;
+            default = "";
+            description = "IMAP server hostname";
+          };
+
+          port = lib.mkOption {
+            type = lib.types.int;
+            default = 993;
+            description = "IMAP server port (TLS)";
+          };
+
+          username = lib.mkOption {
+            type = lib.types.str;
+            default = "";
+            description = "IMAP username (usually email address)";
+          };
+
+          passwordSecret = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = "sops secret name for IMAP password";
+          };
+
+          mailbox = lib.mkOption {
+            type = lib.types.str;
+            default = "INBOX";
+            description = "IMAP mailbox to watch";
+          };
+        };
+      };
+
+      xmpp = {
+        enable = lib.mkEnableOption "XMPP client for this agent";
+
+        jid = lib.mkOption {
+          type = lib.types.str;
+          default = "${name}@${cfg.domain}";
+          description = "XMPP JID for this agent";
+        };
+
+        passwordSecret = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = "sops secret name for XMPP password";
+        };
+
+        rooms = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [];
+          description = "MUC rooms to auto-join on connect";
+        };
+      };
     };
   };
 
   enabledAgents = lib.filterAttrs (_: a: a.enable) cfg.agents;
   sudoAgents = lib.filterAttrs (_: a: a.enable && a.sudo.enable) cfg.agents;
   claudeCodeAgents = lib.filterAttrs (_: a: a.enable && a.claudeCode.enable) cfg.agents;
+  daemonAgents = lib.filterAttrs (_: a: a.enable && a.daemon.enable) cfg.agents;
+  xmppAgents = lib.filterAttrs (_: a: a.enable && a.xmpp.enable) cfg.agents;
 
   # ── Shared Agent Identity ──────────────────────────────────────
   # Single source of truth for agent identity facts.
@@ -534,6 +632,15 @@ let
       - **Other artifacts**: Credit ${cfg.humanName} wherever authorship is noted
     '');
 
+    daemonSection = lib.optionalString agent.daemon.enable ''
+
+      ## Daemon
+
+      Your daemon runs continuously and can act on your behalf between sessions.
+      You can leave watchers in `~/.claude/clauding.md` — the daemon evaluates
+      them on incoming events (mail, XMPP) and runs actions automatically.
+    '';
+
     extraSection = lib.optionalString (agent.claudeCode.extraPrompt != "") ''
 
       ${agent.claudeCode.extraPrompt}
@@ -576,7 +683,7 @@ let
       - **Home**: `${id.home}` — ephemeral, resets on every reboot
       - **Persisted directories**: ${persistList}
       - Everything else in your home is rebuilt from nix on boot
-      ${sudoSection}${deviceSection}${collaborationSection}${adaSection}${extraSection}
+      ${sudoSection}${deviceSection}${collaborationSection}${daemonSection}${adaSection}${extraSection}
     '';
 
   in {
@@ -743,7 +850,7 @@ in
               path="$1"
               shift
               session=$(basename "$path")
-              exec sudo /run/current-system/sw/bin/machinectl shell ${name}@ ${pkgs.bash}/bin/bash -l -c "mkdir -p '$path' && cd '$path' && TMUX= exec ${pkgs.tmux}/bin/tmux -L portal-${name} new-session -As '$session' \\; set -g status off \\; send-keys '${agent.portal.command} $*' C-m"
+              exec /run/current-system/sw/bin/machinectl shell ${name}@ ${pkgs.bash}/bin/bash -l -c "mkdir -p '$path' && cd '$path' && TMUX= exec ${pkgs.tmux}/bin/tmux -L portal-${name} new-session -As '$session' \\; set -g status off \\; send-keys '${agent.portal.command} $*' C-m"
             '';
           in
           pkgs.writeShellScriptBin "portal-${name}" ''
@@ -817,6 +924,7 @@ in
         home = "${cfg.agentsDir}/${name}";
         shell = pkgs.bash;
         extraGroups = lib.optional agent.sudo.enable "nuketown-broker";
+        linger = agent.daemon.enable;
       }) enabledAgents)
       # Human user needs nuketown-secrets to write decrypted keys via broker
       (lib.mkIf (sudoAgents != {} && cfg.humanUser != null) {
@@ -894,6 +1002,73 @@ in
         };
       }))
 
+      # ── XMPP Integration ──────────────────────────────────────────
+      # Generate xmpp.toml for agents with XMPP enabled.
+      (lib.optionalAttrs agent.xmpp.enable {
+        xdg.configFile."nuketown/xmpp.toml".text = let
+          roomsToml = lib.concatMapStringsSep ", " (r: ''"${r}"'') agent.xmpp.rooms;
+          # sops-nix default path: /run/secrets/<secret-name>
+          passwordPath = if agent.xmpp.passwordSecret != null
+            then "/run/secrets/${agent.xmpp.passwordSecret}"
+            else "/dev/null";
+        in ''
+          jid = "${agent.xmpp.jid}"
+          password_file = "${passwordPath}"
+          rooms = [${roomsToml}]
+        '';
+      })
+
+      # ── Daemon Integration ────────────────────────────────────────
+      # Generate repos.toml and a systemd user service for the daemon.
+      (lib.optionalAttrs agent.daemon.enable {
+        xdg.configFile."nuketown/repos.toml".text =
+          lib.concatStringsSep "\n" (lib.mapAttrsToList (repoName: repo: ''
+            [${repoName}]
+            url = "${repo.url}"
+          '') agent.daemon.repos);
+
+        systemd.user.services.nuketown-daemon = {
+          Unit = {
+            Description = "Nuketown agent daemon";
+            After = [ "default.target" ];
+          };
+          Service = {
+            Type = "simple";
+            ExecStart = "${agent.daemon.package}/bin/nuketown-daemon";
+            Restart = "always";
+            RestartSec = 5;
+            Environment = lib.mkMerge [
+              [
+                "NUKETOWN_BOOTSTRAP_MODEL=${agent.daemon.bootstrapModel}"
+                "NUKETOWN_HEADLESS_TIMEOUT=${toString agent.daemon.headlessTimeout}"
+              ]
+              (lib.mkIf (agent.daemon.apiKeySecret != null) [
+                "ANTHROPIC_API_KEY_FILE=/run/secrets/${agent.daemon.apiKeySecret}"
+              ])
+            ];
+          };
+          Install = {
+            WantedBy = [ "default.target" ];
+          };
+        };
+      })
+
+      # ── Mail Watcher ─────────────────────────────────────────────
+      # Generate mail.toml for agents with the IMAP watcher enabled.
+      (lib.optionalAttrs (agent.daemon.enable && agent.daemon.mail.enable) {
+        xdg.configFile."nuketown/mail.toml".text = let
+          passwordPath = if agent.daemon.mail.passwordSecret != null
+            then "/run/secrets/${agent.daemon.mail.passwordSecret}"
+            else "/dev/null";
+        in ''
+          host = "${agent.daemon.mail.host}"
+          port = ${toString agent.daemon.mail.port}
+          username = "${agent.daemon.mail.username}"
+          password_file = "${passwordPath}"
+          mailbox = "${agent.daemon.mail.mailbox}"
+        '';
+      })
+
       # User-provided extraHomeConfig merges last (can override anything above)
       agent.extraHomeConfig
       ]
@@ -939,7 +1114,6 @@ in
 
     # Allow agents to run the approval wrapper via sudo without a password.
     # The wrapper itself gates execution behind the zenity approval dialog.
-    # Also allow the human to use machinectl for portal access.
     security.sudo.extraRules =
       lib.concatLists (lib.mapAttrsToList (name: agent:
         lib.optional agent.sudo.enable {
@@ -963,16 +1137,24 @@ in
             }) agent.sudo.commands;
         }
       ) enabledAgents)
-      # machinectl NOPASSWD for the human when portals are enabled
-      ++ (let
-        portalAgents = lib.filterAttrs (_: a: a.enable && a.portal.enable) cfg.agents;
-      in lib.optionals (cfg.humanUser != null && portalAgents != {}) [{
-        users = [ cfg.humanUser ];
-        commands = [{
-          command = "/run/current-system/sw/bin/machinectl shell *";
-          options = [ "NOPASSWD" ];
-        }];
-      }]);
+      # machinectl sudo rule removed — polkit handles authorization
+      # (see security.polkit.extraConfig below)
+      ;
+
+    # Polkit rule: allow the human to use machinectl shell for portal access.
+    # Using polkit instead of sudo because machinectl talks to machined over
+    # D-Bus, so it works even when NoNewPrivileges is set in the process tree
+    # (common in sandboxed terminals and systemd scopes).
+    security.polkit.extraConfig = let
+      portalAgents = lib.filterAttrs (_: a: a.enable && a.portal.enable) cfg.agents;
+    in lib.mkIf (cfg.humanUser != null && portalAgents != {}) ''
+      polkit.addRule(function(action, subject) {
+        if (action.id === "org.freedesktop.machine1.host-shell" &&
+            subject.user === "${cfg.humanUser}") {
+          return polkit.Result.YES;
+        }
+      });
+    '';
 
     # Socket directory for the broker
     # Only the human (owner) and agents in nuketown-broker group can access
@@ -1016,6 +1198,24 @@ in
         inherit sopsFile;
         owner = name;
       }) agent.secrets.extraSecrets
+      // lib.optionalAttrs (agent.daemon.apiKeySecret != null) {
+        "${agent.daemon.apiKeySecret}" = {
+          inherit sopsFile;
+          owner = name;
+        };
+      }
+      // lib.optionalAttrs (agent.xmpp.passwordSecret != null) {
+        "${agent.xmpp.passwordSecret}" = {
+          inherit sopsFile;
+          owner = name;
+        };
+      }
+      // lib.optionalAttrs (agent.daemon.mail.enable && agent.daemon.mail.passwordSecret != null) {
+        "${agent.daemon.mail.passwordSecret}" = {
+          inherit sopsFile;
+          owner = name;
+        };
+      }
     ) enabledAgents);
   });
 }

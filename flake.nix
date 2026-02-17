@@ -296,6 +296,47 @@
           };
         };
 
+        # Daemon test VM
+        test-daemon = mkTestVM {
+          name = "test-daemon";
+          agentConfig = { pkgs, ... }: {
+            nuketown = {
+              enable = true;
+              domain = "nuketown.test";
+              humanUser = "human";
+
+              agents.ada = {
+                enable = true;
+                uid = 1100;
+                role = "software";
+                description = "Daemon test agent";
+
+                persist = [ "projects" ];
+                sudo.enable = true;
+                portal.enable = true;
+
+                daemon = {
+                  enable = true;
+                  package = pkgs.callPackage ./daemon.nix {};
+                  repos = {
+                    hello = { url = "https://github.com/octocat/Hello-World.git"; };
+                  };
+                };
+              };
+            };
+          };
+
+          extraConfig = { ... }: {
+            systemd.tmpfiles.rules = [
+              "f /run/sudo-approval/mode 0644 human users - MOCK_APPROVED"
+            ];
+
+            home-manager.users.human = {
+              home.stateVersion = "25.11";
+            };
+          };
+        };
+
         # Hardware access test VM
         test-hardware = mkTestVM {
           name = "test-hardware";
@@ -404,12 +445,12 @@
         }
       );
 
-      # Package outputs (empty for now, but useful for future additions)
+      # Package outputs
       packages = forAllSystems (system:
         let
           pkgs = pkgsFor system;
         in {
-          # Could add helper packages here
+          nuketown-daemon = pkgs.callPackage ./daemon.nix {};
         }
       );
     };

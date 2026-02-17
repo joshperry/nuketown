@@ -1,18 +1,199 @@
-# Cloud Agent Design
+# Nuketown Agent Architecture
 
-**One-liner:** Define an AI agent in Nix. Push to main. It's running in the cloud.
+**One-liner:** Define an agent in Nix. Deploy it anywhere — your
+workstation, your servers, the cloud.
 
-This document describes the architecture for running nuketown agents
-remotely — outside the human's physical workstation — while preserving
-the identity, auditability, and approval guarantees of the local model.
+Nuketown agents run as real Unix users on real machines. This document
+describes the three deployment models, the shared infrastructure that
+connects them, and the cloud deployment architecture.
 
-Three work streams converge to make this possible:
+---
 
-1. **XMPP** — communication and approval transport
-2. **Agent daemon** — bootstrap orchestrator with Claude API loop
-3. **K8s pods** — deployment target for cloud agents
+## Deployment Models
 
-Each is independently useful and can be developed in parallel.
+Nuketown agents fall into three categories based on where they run and
+what they do. All share the same framework — the difference is which
+subsystems activate.
+
+### Workstation Agent
+
+**Identity is the collaborator.** The workstation agent is the human's
+daily partner. It works on code, manages the machine's configuration,
+and interacts side-by-side through the portal. There's typically one
+per workstation — wherever the human physically sits.
+
+```nix
+# signi (josh's desktop)
+nuketown.agents.ada = {
+  role = "software";
+  description = ''
+    Software collaborator on signi. Works with josh on embedded
+    systems, NixOS configuration, and web projects.
+  '';
+  portal.enable = true;       # tmux side-by-side
+  sudo.enable = true;         # zenity approval (human is right there)
+  daemon.enable = true;       # socket + XMPP + headless
+  xmpp.enable = true;         # ada@6bit.com
+  devices = [ /* STM32, etc */ ];
+  persist = [ "projects" ".config/claude" ];
+};
+```
+
+Ada is special because she bridges both roles — software collaborator
+AND machine expert. You ask her about a refactor AND about why the
+udev rules aren't working. There's no separate "signi" identity because
+the human is co-located. Splitting them would be like having a coworker
+who sits next to you but insists you email a different department to
+adjust the thermostat.
+
+**What activates:** Everything. Portal, device ACLs, ephemeral homes
+(btrfs rollback), zenity approval, daemon with interactive + headless
+modes, XMPP presence.
+
+### Device Agent
+
+**Identity is the machine.** Each managed device gets its own agent
+that knows its hardware, services, and configuration. You chat with the
+device about itself. The agent IS the server, the gateway, the printer.
+
+```nix
+# liver (XMPP/mail server on Hetzner)
+nuketown.agents.liver = {
+  role = "server";
+  description = ''
+    Prosody XMPP server, dovecot mail, DNS for 6bit.com.
+    Runs on Hetzner VPS. NixOS managed via mynix flake.
+  '';
+  daemon.enable = true;
+  xmpp.enable = true;         # liver@6bit.com
+  sudo = {
+    enable = true;
+    preApproved = [            # routine ops, no interactive approval
+      "systemctl restart *"
+      "journalctl *"
+      "certbot renew"
+    ];
+  };
+};
+
+# gateway (home network router)
+nuketown.agents.gateway = {
+  role = "network";
+  description = ''
+    Home network gateway. WireGuard tunnels, nftables firewall,
+    DHCP/DNS for local network.
+  '';
+  daemon.enable = true;
+  xmpp.enable = true;         # gateway@6bit.com
+};
+
+# printer (Raspberry Pi with 3D printer)
+nuketown.agents.printer = {
+  role = "fabrication";
+  description = ''
+    Raspberry Pi running Klipper for the Ender 3.
+    Manages print jobs, monitors temperatures, detects failures.
+  '';
+  daemon.enable = true;
+  xmpp.enable = true;         # printer@6bit.com
+  devices = [
+    { subsystem = "tty"; attrs = { idVendor = "1a86"; }; }  # printer serial
+  ];
+};
+```
+
+You DM `liver@6bit.com`: "Is the Prosody TLS cert still valid?" It
+runs `openssl s_client`, reports back. "Renew it." It runs certbot,
+restarts Prosody, confirms.
+
+You DM `printer@6bit.com`: "What's the print status?" It checks
+Klipper's API, reports bed temp, progress percentage, estimated time.
+
+**What activates:** Daemon (headless-only), XMPP, persistent home
+(no btrfs rollback — servers need state across reboots), scoped sudo
+with pre-approved commands for routine operations. No portal, no zenity
+(no desktop). Approval for non-routine operations flows through XMPP.
+
+**What doesn't:** Portal (no one sitting there), ephemeral homes
+(servers need persistence), device ACLs (usually — except things like
+the printer's serial port).
+
+### Cloud Agent
+
+**Identity is the role.** Cloud agents don't care what hardware
+they're on — the infrastructure is an API call away. You talk to them
+about their work, not about the VM or pod they're executing in.
+
+```nix
+nuketown.agents.ada = {
+  # Same ada, but cloud-deployed for a specific task
+  cloud = {
+    enable = true;
+    resources = "standard";
+    scaling.maxResources = "large";
+  };
+};
+```
+
+When you chat with a cloud agent, you're talking about orchestrating
+resources, not managing a specific machine. "I need a GPU for this
+build" is a resource request, not a sysadmin task. The approval system
+gates scaling, the infrastructure is fungible.
+
+**What activates:** Daemon (headless), XMPP, cloud resource management,
+workload identity for secrets. Pod restart = clean slate (same semantics
+as btrfs rollback, different mechanism).
+
+**What doesn't:** Portal, device ACLs, zenity, btrfs. Hardware is
+abstract.
+
+### Comparison
+
+| | Workstation | Device | Cloud |
+|---|---|---|---|
+| **Identity** | collaborator | the machine | the role |
+| **Example** | ada on signi | liver, gateway, printer | ada in k8s |
+| **Hardware** | fixed, known, hands-on | fixed, known, remote | fungible, requested |
+| **You ask about** | code AND the machine | the machine itself | the work |
+| **Home** | ephemeral (btrfs) | persistent | ephemeral (pod restart) |
+| **Approval** | zenity + XMPP | XMPP + pre-approved | XMPP |
+| **Portal** | yes | no | no |
+| **Scaling** | N/A | N/A | resource tiers |
+| **Count** | 1-2 (where you sit) | 1 per device | many, role-based |
+
+### What They Share
+
+All three models use the same `nuketown.agents` options. The daemon,
+XMPP, identity (keys, git config, TOML), and approval stanzas are
+shared infrastructure. The deployment model is determined by which
+options you enable, not by a separate module.
+
+Your XMPP roster becomes your infrastructure dashboard — collaborators,
+servers, devices, cloud workers. You just chat with them.
+
+```
+Contacts:
+  ada@6bit.com        ● Working: nuketown refactor
+  liver@6bit.com      ● Ready
+  gateway@6bit.com    ● Ready
+  printer@6bit.com    ○ Offline
+```
+
+---
+
+## Cloud Deployment
+
+**One-liner:** Define a cloud agent in Nix. Push to main. It's running.
+
+This section describes the architecture for running nuketown agents in
+the cloud — Kubernetes pods with the same identity, auditability, and
+approval guarantees as local agents.
+
+Three work streams converge:
+
+1. **XMPP** — communication and approval transport (shared with device agents)
+2. **Agent daemon** — bootstrap + headless sessions (shared with device agents)
+3. **K8s pods** — scheduling, scaling, persistence (cloud-specific)
 
 ### The Vercel analogy
 
@@ -41,7 +222,9 @@ Kubernetes replaces VM lifecycle management with one API:
 
 ---
 
-## 1. XMPP Integration
+## XMPP Integration
+
+*Shared infrastructure — serves workstation, device, and cloud agents.*
 
 ### Existing Infrastructure
 
@@ -75,45 +258,139 @@ documenting the JID and available rooms.
 
 ### Approval Over XMPP
 
-The approval broker gains an XMPP backend alongside zenity:
+### Auth Broker as XMPP Client
+
+The approval broker runs its own XMPP client session on the **human's**
+side, connecting as `josh@6bit.com/nuketown-broker`. This is a separate
+session from the human's chat client — the broker is a dedicated
+approval surface, not a chat window.
 
 ```
 agent runs `sudo <cmd>`
   -> sudo shim (unchanged)
     -> broker socket (unchanged)
-      -> broker sends XMPP message to human's JID
-        -> human replies "yes <id>" or "no <id>"
-          -> broker writes APPROVED/DENIED to socket
+      -> broker sends custom XMPP stanza to human's bare JID
+      -> broker shows zenity popup (if local desktop available)
+      <- first response wins (XMPP reply or zenity click)
+        -> broker writes APPROVED/DENIED to socket
 ```
 
 The Unix socket between agent and broker stays — it's the security
-boundary. XMPP replaces only the human-facing notification channel.
+boundary. The broker's XMPP client and zenity are two parallel
+notification channels to the human. First response wins.
 
-**Hybrid mode:** When both backends are available, the broker sends a
-zenity popup AND an XMPP message. First response wins. This preserves
-local desktop workflow while enabling remote approval.
+### Custom Stanza Namespace
 
-**Message format:**
+Approval requests use a custom XML namespace, not plain chat messages:
+
+```xml
+<message to="josh@6bit.com" id="a1b2c3" type="normal">
+  <approval xmlns="urn:nuketown:approval" id="a1b2c3">
+    <agent>ada</agent>
+    <kind>sudo</kind>
+    <command>nixos-rebuild switch</command>
+    <timeout>120</timeout>
+  </approval>
+</message>
 ```
-[Approval #a1b2c3]
-Agent: ada
-Command: nixos-rebuild switch
-Reply "yes a1b2c3" or "no a1b2c3"
+
+Different request kinds use the same namespace with different `<kind>`
+values:
+
+| Kind | Payload | Example |
+|------|---------|---------|
+| `sudo` | `<command>` | `nixos-rebuild switch` |
+| `delegate` | `<task>`, `<agents>` | Spawn 3 researchers for API review |
+| `scale` | `<from>`, `<to>` | `standard` → `large` |
+| `network` | `<egress>` | Allow `pypi.org:443` |
+
+Responses use the same namespace:
+
+```xml
+<message to="ada@6bit.com" type="normal">
+  <approval-response xmlns="urn:nuketown:approval" id="a1b2c3">
+    <result>approved</result>
+  </approval-response>
+</message>
 ```
 
-Short hex IDs for human-friendly typing. Timeout after 120s (configurable),
-auto-deny on timeout.
+This keeps the protocol structured and extensible without inventing
+a new transport.
 
-**Approval generalizes beyond sudo in the cloud:**
+### Server-Side Filtering
+
+Prosody routes stanzas based on namespace, so the auth broker and
+chat client never interfere:
+
+```
+agent sends <message> to josh@6bit.com
+  ├── has <approval xmlns="urn:nuketown:approval">
+  │     -> route to resource advertising urn:nuketown:approval (broker)
+  └── plain <message type="chat">
+        -> route to chat client per normal XMPP rules
+```
+
+Implementation: a small Prosody module (deployed via mynix/liver) that
+inspects incoming messages for the `urn:nuketown:approval` namespace
+and routes them to the resource that advertises that feature via
+service discovery (XEP-0030). The broker advertises the feature on
+connect; the chat client doesn't.
+
+This means agents don't need to know the broker's full JID — they
+send to the bare JID and the server handles routing. If the broker
+is offline, the message falls through to normal delivery (chat client
+gets it as a fallback notification).
+
+### Zenity Styling Per Agent
+
+When the broker is running on a local desktop, zenity popups are
+styled per agent — different agents get distinct visual treatment
+so the human can tell at a glance who's asking:
+
+```
+┌─ ada (software) ─────────────────────┐
+│  sudo: nixos-rebuild switch          │
+│                                      │
+│           [Approve]  [Deny]          │
+└──────────────────────────────────────┘
+
+┌─ vox (research) ─────────────────────┐
+│  delegate: spawn 2 search agents     │
+│  for: "survey XMPP client libraries" │
+│                                      │
+│           [Approve]  [Deny]          │
+└──────────────────────────────────────┘
+```
+
+### Delegation as Approval
+
+Agent team spawning flows through the same approval surface as sudo.
+An agent that wants teammates requests delegation:
+
+```
+ada: I need to parallelize this — can I spin up 3 researchers?
+  -> delegation request via urn:nuketown:approval (kind=delegate)
+  -> broker shows zenity / sends to chat client
+  -> human approves
+  -> broker responds approved
+  -> agent (or daemon) spawns teammates
+```
+
+Same model everywhere: escalation needs a human, de-escalation is free.
+Spawning costs money and compute — it's an escalation.
+
+### Approval Generalizes
 
 | Escalation | Local | Cloud |
 |-----------|-------|-------|
-| Sudo | Zenity dialog | XMPP approval |
-| More resources | N/A (fixed hardware) | XMPP approval -> pod reschedule |
-| GPU access | N/A (plug in device) | XMPP approval -> GPU node pool |
-| Network access | N/A (local network) | XMPP approval -> NetworkPolicy update |
+| Sudo | Zenity + XMPP | XMPP (no desktop) |
+| Delegation | Zenity + XMPP | XMPP |
+| More resources | N/A (fixed hardware) | XMPP -> pod reschedule |
+| GPU access | N/A (plug in device) | XMPP -> GPU node pool |
+| Network access | N/A (local network) | XMPP -> NetworkPolicy update |
 
-Same model: human-in-the-loop for escalation, automatic for de-escalation.
+Timeout after 120s (configurable), auto-deny on timeout. Short hex IDs
+for correlation across channels.
 
 ### Presence
 
@@ -126,13 +403,25 @@ Agent presence maps to XMPP show states:
 | Blocked | `away` | Waiting for sudo approval |
 | Offline | --- | Daemon not running |
 
-The human sees agent status in their regular XMPP client.
+The human sees all agents — collaborators, servers, devices, cloud
+workers — in their regular XMPP client. The roster IS the
+infrastructure dashboard:
+
+```
+ada@6bit.com          ● Working: nuketown Phase 3
+liver@6bit.com        ● Ready
+gateway@6bit.com      ● Ready
+printer@6bit.com      ○ Offline
+```
 
 ### Agent-to-Agent
 
 Agents message each other directly via JID or through MUC rooms.
 Room provisioning is a server-side concern (mynix/liver config).
 Nuketown agents auto-join configured rooms on connect.
+
+Device agents and cloud agents can coordinate — liver can tell ada
+about a Prosody issue, ada can push a fix and tell liver to deploy it.
 
 ### Client Library
 
@@ -142,7 +431,9 @@ event loop as the agent daemon — no IPC needed.
 
 ---
 
-## 2. Agent Daemon
+## Agent Daemon
+
+*Shared infrastructure — runs on every agent regardless of deployment model.*
 
 The daemon is the single long-running process per agent. It combines
 the XMPP client, the Claude API bootstrap loop, and session management
@@ -156,6 +447,14 @@ Agent Daemon (systemd user service, Python/asyncio)
 |   +-- Presence publisher
 |   +-- Message handler (task requests, approval responses)
 |   +-- MUC participant
++-- Mail watcher (aioimaplib)
+|   +-- IMAP IDLE push (persistent connection)
+|   +-- Auth verification (DKIM/SPF/DMARC + domain trust)
+|   +-- Unseen processing on connect
++-- Clauding evaluator
+|   +-- Pre-filter (tags, trust, debounce)
+|   +-- Haiku triage (single API call, ~$0.01)
+|   +-- Action dispatch (headless session on match)
 +-- Bootstrap loop (Claude Haiku via Agent SDK)
 |   +-- Workspace resolver (clone, checkout, setup)
 |   +-- Known remotes (from nix config + existing clones)
@@ -209,12 +508,129 @@ XMPP: "ada, work on nuketown -- fix udev block device handling"
 
 ### Session Lifecycle
 
-- **Interactive (portal/local):** daemon launches claude-code CLI,
-  fire-and-forget. Human watches via portal.
+- **Interactive (portal/local):** daemon launches claude-code CLI in
+  a tmux session named after the project basename (e.g., `nuketown`).
+  The portal command uses the same naming convention — if the session
+  already exists, it attaches rather than creating a new one. This
+  means the daemon can start a session before the human opens a portal,
+  and `portal-ada` just connects to what's already running. No
+  coordination needed between daemon and portal beyond the shared
+  tmux session name.
 - **Headless (cloud/automated):** daemon runs Agent SDK query directly.
   Streams meaningful progress to XMPP. Enforces timeout (default 4h).
 - **Queue:** one task at a time. Second request gets queued with
   notification: "ada is currently working on X, your request is queued."
+
+### Mail Integration
+
+The daemon maintains a persistent IMAP IDLE connection (RFC 2177) to
+the agent's mailbox. When new mail arrives, the server pushes a
+notification — no polling, no delay.
+
+```
+Email arrives at ada@6bit.com
+  -> dovecot stores in INBOX
+  -> IMAP server pushes EXISTS to IDLE connection
+  -> daemon breaks IDLE, fetches headers + snippet
+  -> parses Authentication-Results (DKIM/SPF/DMARC)
+  -> invokes mail callback
+  -> re-enters IDLE
+```
+
+**Auth verification:** The daemon parses the `Authentication-Results`
+header (RFC 8601) added by the receiving mail server to determine
+sender trust. External mail (GitHub notifications, mailing lists)
+carries DKIM/SPF results. Local mail (same domain) is trusted
+implicitly since we control the mail server.
+
+**Reconnection:** IMAP IDLE refreshes every 25 minutes (servers
+timeout at 29min per RFC 2177). On connection loss, reconnects with
+exponential backoff. On reconnect, processes any UNSEEN messages
+accumulated while disconnected.
+
+**Configuration:**
+
+```nix
+nuketown.agents.<name>.daemon.mail = {
+  host = "mail.6bit.com";
+  username = "ada@6bit.com";
+  # password from email-password sops secret
+};
+```
+
+### Clauding: Event-Driven Evaluation
+
+Clauding replaces timer-based polling with push-based evaluation.
+When an event arrives (currently mail, future: XMPP messages, socket
+requests), the daemon evaluates it against `~/.claude/clauding.md`
+watchers. On match, it notifies the human via XMPP and executes the
+action via a headless session.
+
+```
+Event (mail, XMPP, socket)
+  │
+  ├─ Pre-filter                      [free — file read + string checks]
+  │    ├─ No waiting entries? → skip
+  │    ├─ Untrusted sender? → skip
+  │    ├─ Debounce window? → skip
+  │    ├─ Tags present and none match? → skip
+  │    └─ Pass → proceed to triage
+  │
+  ├─ Haiku triage                    [cheap — single API call, ~$0.01]
+  │    ├─ Prompt: "Does this event match any watcher?"
+  │    ├─ Response: MATCH:<name> or NO_MATCH
+  │    └─ No tool loop, just messages.create()
+  │
+  └─ If MATCH:
+       ├─ Notify human via XMPP
+       ├─ Build action prompt from entry context
+       └─ Headless session executes action (Sonnet, with tools)
+            └─ Updates clauding.md status to done
+```
+
+**Pre-filter:** Before spending any API cost, the daemon runs cheap
+local checks. Tags are optional backtick-delimited strings in each
+entry — if present, at least one must appear in the event text
+(sender, subject, or body) for that entry to be considered. This
+eliminates most irrelevant events without an API call.
+
+**Triage:** A single Haiku call with a constrained prompt. No tools,
+no agentic loop — just "does this match?" Returns MATCH or NO_MATCH.
+Cost: ~$0.005-0.02 per call, ~5-10 calls/day with tag filtering.
+
+**Saga pattern:** The real power is chaining. After completing work,
+an agent can leave a new watcher for the next step — "I opened PR
+#47, watch for it to merge so I can update the downstream dep." The
+work creates the watchers, and the watchers create more work. This
+externalizes the agent's situational awareness into durable state
+that survives reboots and context windows.
+
+**clauding.md format:**
+
+```markdown
+## k3s-nix-snapshotter
+
+- **watch**: PR #172 in pdtpartners/nix-snapshotter gets merged
+- **tags**: `github.com`, `nix-snapshotter`, `172`
+- **since**: 2026-02-13
+- **status**: waiting
+
+### Context
+[background for a fresh session to understand the work]
+
+### Action
+[steps the headless session should execute on match]
+```
+
+Watch conditions are natural language — Haiku does the matching, not
+regex. Tags are optional pre-filter hints to avoid unnecessary API
+calls. Status transitions from `waiting` to `done YYYY-MM-DD` when
+the action completes.
+
+**Cost model:** With ~20 trusted emails/day and 1-2 active watchers,
+pre-filtering eliminates most events. ~5-10 triage calls/day at
+~$0.01 each = ~$0.10/day. Action sessions fire rarely at ~$0.30-0.50
+each. Monthly: ~$3-5.
 
 ### NixOS Integration
 
@@ -231,12 +647,16 @@ nuketown.agents.<name>.daemon = {
 Generates a systemd user service under the agent account:
 - `ExecStart = nuketown-daemon`
 - `Restart = always`
+- Sets `users.users.${name}.linger = true` so the user manager
+  (and the daemon) starts at boot without requiring a login session
 - Reads identity.toml, repos config, API key from sops
 - Connects to XMPP on startup
 
 ---
 
-## 3. K8s Pod Deployment
+## K8s Pod Deployment
+
+*Cloud-specific — scheduling, persistence, and secrets for cloud agents.*
 
 ### The NixOS config is the cloud API
 
@@ -305,18 +725,53 @@ picks sensible defaults for everything else.
 
 ### Resource Tiers
 
-Abstract away instance types entirely:
+Tiers are defined in `nuketown.cloud.tiers` by the cluster admin.
+Each tier declares the resources and scheduling constraints for that
+class of workload. `toKubeManifests` uses these definitions to
+generate pod resource requests/limits, node selectors, and
+tolerations.
 
-| Tier | Intent | Rough shape |
-|------|--------|-------------|
-| `small` | Idle / light tasks | 1 vCPU, 2GB RAM |
-| `standard` | Normal development work | 2 vCPU, 4GB RAM |
-| `large` | Builds, compilation | 4 vCPU, 8GB RAM |
-| `gpu` | ML workloads | GPU node pool |
+```nix
+nuketown.cloud.tiers = {
+  small = {
+    cpu = "1";
+    memory = "2Gi";
+    nodeSelector = { "nuketown.io/tier" = "small"; };
+  };
+  standard = {
+    cpu = "2";
+    memory = "4Gi";
+    nodeSelector = { "nuketown.io/tier" = "standard"; };
+  };
+  large = {
+    cpu = "4";
+    memory = "8Gi";
+    nodeSelector = { "nuketown.io/tier" = "large"; };
+  };
+  gpu = {
+    cpu = "4";
+    memory = "16Gi";
+    resources = { "nvidia.com/gpu" = "1"; };
+    nodeSelector = { "nuketown.io/tier" = "gpu"; };
+    tolerations = [
+      { key = "nvidia.com/gpu"; operator = "Exists"; effect = "NoSchedule"; }
+    ];
+  };
+};
+```
 
-The `toKubeManifests` function maps tiers to k8s resource
-requests/limits. Cluster operators configure node pools to satisfy
-them. Users never see instance types.
+The tier definitions are the single source of truth — they describe
+both what the agent needs and where it runs. The cluster admin
+matches these to their infrastructure by labeling node pools with
+`nuketown.io/tier`. Agents just reference a tier name:
+
+```nix
+nuketown.agents.ada.cloud.resources = "standard";
+```
+
+If an agent requests a tier that isn't defined, nix evaluation fails.
+If the tier is defined but no matching node pool exists in the
+cluster, the pod stays unschedulable — k8s reports the reason.
 
 ```nix
 nuketown.cloud = {
@@ -442,6 +897,61 @@ nuketown.agents.ada.cloud.identity = {
 };
 ```
 
+### Identity Self-Provisioning
+
+The GitHub PAT is the single root credential per agent. SSH and GPG
+keys are derived from it, not pre-generated.
+
+```
+GitHub PAT (sops)
+  └── agent boot
+        ├── check: ~/.ssh/id_ed25519 exists?
+        │     yes -> done (persisted from previous boot)
+        │     no  -> generate keypair
+        │            -> DELETE stale keys from GitHub (by title match)
+        │            -> POST /user/keys (upload public SSH key)
+        │
+        ├── check: ~/.gnupg/ has signing key?
+        │     yes -> done
+        │     no  -> generate GPG key (from identity.toml: name, email)
+        │            -> DELETE stale GPG keys from GitHub
+        │            -> POST /user/gpg_keys (upload public GPG key)
+        │
+        └── ready (can push signed commits)
+```
+
+**One secret per agent.** The PAT in sops is the only credential the
+human provisions. Everything else — SSH identity, GPG signing, GitHub
+API access — derives from it.
+
+**Persist for performance, re-derive for resilience.** Key directories
+(`~/.ssh`, `~/.gnupg`) are persisted so the agent doesn't re-provision
+on every reboot. But if persistence is lost (disk failure, PVC
+migration, fresh cluster), the agent detects missing keys and
+re-provisions from the PAT on next boot. Stale keys are cleaned up
+from GitHub automatically.
+
+**PAT scopes required:**
+- `repo` — push, open PRs
+- `admin:public_key` — manage SSH keys
+- `admin:gpg_key` — manage GPG keys
+
+```nix
+nuketown.agents.<name>.github = {
+  enable = true;
+  pat = "ada/github-pat";  # sops secret name
+  # SSH/GPG key dirs auto-added to persist
+  # Boot service handles generation + upload
+};
+```
+
+The module generates a systemd oneshot service that runs before the
+daemon, checks for existing keys, and provisions if missing.
+
+For cloud agents, the PAT itself can come from the cloud secret
+store (via workload identity) instead of sops — same self-provisioning
+flow, different root credential source.
+
 ### Identity Projection
 
 `mkIdentity` and `mkIdentityToml` work unchanged — baked into the
@@ -540,18 +1050,34 @@ XMPP client (slixmpp)
 
 ### Development Phases
 
-**Phase 1 -- Local daemon (no XMPP):**
+**Phase 1 -- Local daemon (no XMPP):** DONE
 Agent daemon with local socket only. Portal sends requests. Bootstrap
 loop resolves preconditions. Launches claude-code. Useful immediately
 on signi.
 
-**Phase 2 -- XMPP client:**
+**Phase 2 -- XMPP client:** DONE
 Daemon connects to 6bit.com. Presence, messaging, approval over XMPP.
 Human can send tasks from phone. Approval works remotely.
 
-**Phase 3 -- Headless sessions:**
-Agent SDK for fully automated sessions. Daemon streams progress to
-XMPP. No portal needed.
+**Phase 3 -- Headless sessions:** DONE
+Anthropic API agent loop for fully automated sessions. Daemon streams
+progress to XMPP. No portal needed. Enables device agents.
+
+**Phase 3.1 -- Mail integration:** DONE
+IMAP IDLE push-based mail watching. Persistent connection with auto-
+reconnect. Auth verification (DKIM/SPF/DMARC) and domain trust.
+Processes unseen messages on connect.
+
+**Phase 3.2 -- Clauding evaluation:** DONE
+Event-driven evaluation of clauding.md watchers. Pre-filter chain
+(tags, trust, debounce) eliminates most events. Haiku triage for
+matching. Headless Sonnet sessions for actions. XMPP notifications
+on match. Full pipeline: email → triage → action → status update.
+
+**Phase 3.5 -- Device agent deployment:**
+Deploy daemon to managed NixOS machines (liver, gateway, etc.).
+Pre-approved sudo commands for routine ops. XMPP identity per device.
+First real test of the "chat with your infrastructure" model.
 
 **Phase 4 -- K8s deployment:**
 `nuketown.cloud` options, `toKubeManifests`, OCI image builds. Pod
@@ -641,4 +1167,5 @@ Nuketown Cloud would be the first tool that:
 
 ---
 
-*The town is disposable. Now it runs anywhere there's a cluster.*
+*The town is disposable. The agents run everywhere — your desk, your
+servers, the cloud. You just chat with them.*

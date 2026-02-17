@@ -63,6 +63,7 @@ class AgentXMPPClient:
         self._connected = asyncio.Event()
         self._disconnected_event = asyncio.Event()
         self._stopping = False
+        self._reconnecting = False
 
     @property
     def connected(self) -> bool:
@@ -127,23 +128,29 @@ class AgentXMPPClient:
         log.warning("XMPP disconnected: %s", self.jid)
         self._connected.clear()
         self._disconnected_event.set()
-        if not self._stopping:
+        if not self._stopping and not self._reconnecting:
             asyncio.ensure_future(self._reconnect())
 
     async def _reconnect(self, delay: float = 5, max_delay: float = 300) -> None:
         """Reconnect with exponential backoff."""
-        current_delay = delay
-        while not self._stopping:
-            log.info("reconnecting in %.0fs...", current_delay)
-            await asyncio.sleep(current_delay)
-            if self._stopping:
-                break
-            log.info("reconnecting to XMPP as %s", self.jid)
-            self._xmpp.connect()
-            if await self.wait_connected(timeout=30):
-                log.info("XMPP reconnected: %s", self.jid)
-                return
-            current_delay = min(current_delay * 2, max_delay)
+        if self._reconnecting:
+            return
+        self._reconnecting = True
+        try:
+            current_delay = delay
+            while not self._stopping:
+                log.info("reconnecting in %.0fs...", current_delay)
+                await asyncio.sleep(current_delay)
+                if self._stopping:
+                    break
+                log.info("reconnecting to XMPP as %s", self.jid)
+                self._xmpp.connect()
+                if await self.wait_connected(timeout=30):
+                    log.info("XMPP reconnected: %s", self.jid)
+                    return
+                current_delay = min(current_delay * 2, max_delay)
+        finally:
+            self._reconnecting = False
 
     async def connect_and_run(self) -> None:
         """Connect to the XMPP server and process events.

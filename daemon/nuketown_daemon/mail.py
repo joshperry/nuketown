@@ -216,8 +216,8 @@ class MailWatcher:
             log.error("IMAP SELECT failed: %s", resp.lines)
             return
 
-        # Note the current highest UID so we only notify on truly new mail
-        last_seen = await self._get_max_uid()
+        # Process any unseen messages from before we connected
+        last_seen = await self._process_unseen()
         log.info("IMAP IDLE starting (last seen UID: %s)", last_seen)
 
         while not self._stopping:
@@ -254,6 +254,34 @@ class MailWatcher:
         if not uids:
             return 0
         return int(uids[-1])
+
+    async def _process_unseen(self) -> int:
+        """Process unseen messages on connect, return max UID across all messages."""
+        max_uid = await self._get_max_uid()
+
+        resp = await self._client.uid_search("UNSEEN")
+        if resp.result != "OK" or not resp.lines or not resp.lines[0]:
+            log.info("no unseen messages on connect")
+            return max_uid
+
+        raw = resp.lines[0]
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        uids = raw.split()
+        if not uids:
+            log.info("no unseen messages on connect")
+            return max_uid
+
+        log.info("processing %d unseen messages on connect", len(uids))
+        for uid in uids:
+            try:
+                notification = await self._fetch_notification(uid)
+                if notification and self._callback:
+                    await self._callback(notification)
+            except Exception:
+                log.exception("error processing unseen mail UID %s", uid)
+
+        return max_uid
 
     async def _process_new_mail(self, last_seen: int) -> int:
         """Fetch and process messages with UID > last_seen. Returns new max UID."""

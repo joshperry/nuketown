@@ -183,12 +183,18 @@ class Daemon:
         if self._clauding:
             from .clauding import Event
 
+            # Trust mail authenticated via DKIM/SPF, or from our own domain
+            # (local delivery on our server is inherently authenticated)
+            trusted = notification.auth.trusted
+            if not trusted and self.cfg.domain and notification.auth.from_domain:
+                trusted = notification.auth.from_domain == self.cfg.domain
+
             event = Event(
                 source="mail",
                 sender=notification.from_addr,
                 subject=notification.subject,
                 body=notification.snippet,
-                trusted=notification.auth.trusted,
+                trusted=trusted,
                 timestamp=time.monotonic(),
             )
             await self._try_evaluate(event)

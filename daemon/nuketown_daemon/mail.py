@@ -247,7 +247,10 @@ class MailWatcher:
         resp = await self._client.uid_search("ALL")
         if resp.result != "OK" or not resp.lines or not resp.lines[0]:
             return 0
-        uids = resp.lines[0].split()
+        raw = resp.lines[0]
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        uids = raw.split()
         if not uids:
             return 0
         return int(uids[-1])
@@ -258,7 +261,11 @@ class MailWatcher:
         if resp.result != "OK" or not resp.lines or not resp.lines[0]:
             return last_seen
 
-        uids = [u for u in resp.lines[0].split() if int(u) > last_seen]
+        # aioimaplib may return UIDs as bytes or str depending on version
+        raw_uids = resp.lines[0]
+        if isinstance(raw_uids, bytes):
+            raw_uids = raw_uids.decode()
+        uids = [u for u in raw_uids.split() if int(u) > last_seen]
         if not uids:
             return last_seen
 

@@ -632,6 +632,15 @@ let
       - **Other artifacts**: Credit ${cfg.humanName} wherever authorship is noted
     '');
 
+    daemonSection = lib.optionalString agent.daemon.enable ''
+
+      ## Daemon
+
+      Your daemon runs continuously and can act on your behalf between sessions.
+      You can leave watchers in `~/.claude/clauding.md` — the daemon evaluates
+      them on incoming events (mail, XMPP) and runs actions automatically.
+    '';
+
     extraSection = lib.optionalString (agent.claudeCode.extraPrompt != "") ''
 
       ${agent.claudeCode.extraPrompt}
@@ -674,7 +683,7 @@ let
       - **Home**: `${id.home}` — ephemeral, resets on every reboot
       - **Persisted directories**: ${persistList}
       - Everything else in your home is rebuilt from nix on boot
-      ${sudoSection}${deviceSection}${collaborationSection}${adaSection}${extraSection}
+      ${sudoSection}${deviceSection}${collaborationSection}${daemonSection}${adaSection}${extraSection}
     '';
 
   in {

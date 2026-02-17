@@ -39,6 +39,17 @@ class XMPPConfig:
 
 
 @dataclass
+class MailConfig:
+    """IMAP mail watcher configuration."""
+
+    host: str = ""
+    port: int = 993
+    username: str = ""
+    password: str = ""
+    mailbox: str = "INBOX"
+
+
+@dataclass
 class DaemonConfig:
     """Complete daemon configuration."""
 
@@ -66,6 +77,9 @@ class DaemonConfig:
 
     # XMPP (None if not configured)
     xmpp: XMPPConfig | None = None
+
+    # Mail watcher (None if not configured)
+    mail: MailConfig | None = None
 
 
 def load_identity(path: Path | None = None) -> dict:
@@ -156,6 +170,48 @@ def load_xmpp_config(path: Path | None = None) -> XMPPConfig | None:
     return XMPPConfig(jid=jid, password=password, rooms=rooms)
 
 
+def load_mail_config(path: Path | None = None) -> MailConfig | None:
+    """Load mail.toml and read password from file.
+
+    Returns None if mail.toml doesn't exist or lacks required fields.
+    """
+    if path is None:
+        path = (
+            Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+            / "nuketown"
+            / "mail.toml"
+        )
+    if not path.exists():
+        return None
+
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+
+    host = data.get("host", "")
+    username = data.get("username", "")
+    if not host or not username:
+        log.warning("mail.toml missing 'host' or 'username'")
+        return None
+
+    password_file = data.get("password_file", "")
+    password = ""
+    if password_file:
+        pw_path = Path(password_file)
+        if pw_path.exists():
+            password = pw_path.read_text().strip()
+        else:
+            log.warning("mail password file not found: %s", password_file)
+            return None
+
+    return MailConfig(
+        host=host,
+        port=data.get("port", 993),
+        username=username,
+        password=password,
+        mailbox=data.get("mailbox", "INBOX"),
+    )
+
+
 def load_config() -> DaemonConfig:
     """Build DaemonConfig from all sources."""
     identity = load_identity()
@@ -185,5 +241,8 @@ def load_config() -> DaemonConfig:
 
     # XMPP config (optional)
     cfg.xmpp = load_xmpp_config()
+
+    # Mail watcher config (optional)
+    cfg.mail = load_mail_config()
 
     return cfg

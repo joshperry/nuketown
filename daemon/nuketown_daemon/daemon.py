@@ -59,6 +59,9 @@ class Daemon:
         self._presence = None
         self._approval = None
 
+        # Mail watcher (initialised in run() if configured)
+        self._mail_task: asyncio.Task | None = None  # type: ignore[type-arg]
+
     async def run(self, shutdown_event: asyncio.Event) -> None:
         """Run the daemon until shutdown_event is set."""
         await self._server.start()
@@ -67,11 +70,16 @@ class Daemon:
         if self.cfg.xmpp:
             await self._start_xmpp()
 
+        # Start mail watcher if configured
+        if self.cfg.mail:
+            self._start_mail()
+
         log.info(
-            "daemon ready: agent=%s socket=%s xmpp=%s",
+            "daemon ready: agent=%s socket=%s xmpp=%s mail=%s",
             self.cfg.agent_name,
             self.cfg.socket_path,
             self.cfg.xmpp.jid if self.cfg.xmpp else "disabled",
+            self.cfg.mail.username if self.cfg.mail else "disabled",
         )
         try:
             await shutdown_event.wait()
@@ -125,7 +133,47 @@ class Daemon:
 
                 self._xmpp_client.send_message(from_jid, json.dumps(result))
 
+    def _start_mail(self) -> None:
+        """Start the IMAP IDLE mail watcher."""
+        from .mail import MailWatcher
+
+        mail_cfg = self.cfg.mail
+        assert mail_cfg is not None
+
+        self._mail_watcher = MailWatcher(
+            host=mail_cfg.host,
+            port=mail_cfg.port,
+            username=mail_cfg.username,
+            password=mail_cfg.password,
+            mailbox=mail_cfg.mailbox,
+            callback=self._on_mail,
+        )
+        self._mail_task = asyncio.create_task(self._mail_watcher.run())
+        log.info("mail watcher started: %s@%s", mail_cfg.username, mail_cfg.host)
+
+    async def _on_mail(self, notification) -> None:
+        """Handle a new mail notification."""
+        from .mail import MailNotification
+
+        assert isinstance(notification, MailNotification)
+        trust = "verified" if notification.auth.trusted else "UNVERIFIED"
+        log.info(
+            "mail: from=%s subject=%s [%s] (%s)",
+            notification.from_addr,
+            notification.subject,
+            trust,
+            notification.auth.summary,
+        )
+
     async def _shutdown(self) -> None:
+        if self._mail_task and not self._mail_task.done():
+            if hasattr(self, "_mail_watcher"):
+                await self._mail_watcher.stop()
+            self._mail_task.cancel()
+            try:
+                await self._mail_task
+            except asyncio.CancelledError:
+                pass
         if self._worker_task and not self._worker_task.done():
             self._worker_task.cancel()
             try:

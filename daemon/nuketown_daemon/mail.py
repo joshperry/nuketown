@@ -336,11 +336,12 @@ class MailWatcher:
             return None
 
         # Extract header bytes from response
-        # aioimaplib returns the header data as a bytearray (not bytes)
+        # aioimaplib returns: [bytes(FETCH line), bytearray(data), bytes(")"), bytes(status)]
+        # The actual content is the bytearray element
         raw_headers = b""
         for line in header_resp.lines:
-            if isinstance(line, (bytes, bytearray)):
-                raw_headers += bytes(line) + b"\n"
+            if isinstance(line, bytearray):
+                raw_headers = bytes(line)
 
         if not raw_headers:
             return None
@@ -358,8 +359,8 @@ class MailWatcher:
         if body_resp.result == "OK":
             body_bytes = b""
             for line in body_resp.lines:
-                if isinstance(line, (bytes, bytearray)):
-                    body_bytes += bytes(line) + b"\n"
+                if isinstance(line, bytearray):
+                    body_bytes = bytes(line)
             if body_bytes:
                 try:
                     snippet = body_bytes.decode("utf-8", errors="replace")[:200]

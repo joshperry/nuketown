@@ -683,6 +683,7 @@ let
       - **Home**: `${id.home}` — ephemeral, resets on every reboot
       - **Persisted directories**: ${persistList}
       - Everything else in your home is rebuilt from nix on boot
+      - **Projects**: Your working repositories live under `~/projects/` as siblings — when you need to reference another repo, look there first${lib.optionalString agent.daemon.enable " (see `~/.config/nuketown/repos.toml` for the full list)"}
       ${sudoSection}${deviceSection}${collaborationSection}${daemonSection}${adaSection}${extraSection}
     '';
 

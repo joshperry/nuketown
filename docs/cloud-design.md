@@ -447,6 +447,14 @@ Agent Daemon (systemd user service, Python/asyncio)
 |   +-- Presence publisher
 |   +-- Message handler (task requests, approval responses)
 |   +-- MUC participant
++-- Mail watcher (aioimaplib)
+|   +-- IMAP IDLE push (persistent connection)
+|   +-- Auth verification (DKIM/SPF/DMARC + domain trust)
+|   +-- Unseen processing on connect
++-- Clauding evaluator
+|   +-- Pre-filter (tags, trust, debounce)
+|   +-- Haiku triage (single API call, ~$0.01)
+|   +-- Action dispatch (headless session on match)
 +-- Bootstrap loop (Claude Haiku via Agent SDK)
 |   +-- Workspace resolver (clone, checkout, setup)
 |   +-- Known remotes (from nix config + existing clones)
@@ -512,6 +520,117 @@ XMPP: "ada, work on nuketown -- fix udev block device handling"
   Streams meaningful progress to XMPP. Enforces timeout (default 4h).
 - **Queue:** one task at a time. Second request gets queued with
   notification: "ada is currently working on X, your request is queued."
+
+### Mail Integration
+
+The daemon maintains a persistent IMAP IDLE connection (RFC 2177) to
+the agent's mailbox. When new mail arrives, the server pushes a
+notification — no polling, no delay.
+
+```
+Email arrives at ada@6bit.com
+  -> dovecot stores in INBOX
+  -> IMAP server pushes EXISTS to IDLE connection
+  -> daemon breaks IDLE, fetches headers + snippet
+  -> parses Authentication-Results (DKIM/SPF/DMARC)
+  -> invokes mail callback
+  -> re-enters IDLE
+```
+
+**Auth verification:** The daemon parses the `Authentication-Results`
+header (RFC 8601) added by the receiving mail server to determine
+sender trust. External mail (GitHub notifications, mailing lists)
+carries DKIM/SPF results. Local mail (same domain) is trusted
+implicitly since we control the mail server.
+
+**Reconnection:** IMAP IDLE refreshes every 25 minutes (servers
+timeout at 29min per RFC 2177). On connection loss, reconnects with
+exponential backoff. On reconnect, processes any UNSEEN messages
+accumulated while disconnected.
+
+**Configuration:**
+
+```nix
+nuketown.agents.<name>.daemon.mail = {
+  host = "mail.6bit.com";
+  username = "ada@6bit.com";
+  # password from email-password sops secret
+};
+```
+
+### Clauding: Event-Driven Evaluation
+
+Clauding replaces timer-based polling with push-based evaluation.
+When an event arrives (currently mail, future: XMPP messages, socket
+requests), the daemon evaluates it against `~/.claude/clauding.md`
+watchers. On match, it notifies the human via XMPP and executes the
+action via a headless session.
+
+```
+Event (mail, XMPP, socket)
+  │
+  ├─ Pre-filter                      [free — file read + string checks]
+  │    ├─ No waiting entries? → skip
+  │    ├─ Untrusted sender? → skip
+  │    ├─ Debounce window? → skip
+  │    ├─ Tags present and none match? → skip
+  │    └─ Pass → proceed to triage
+  │
+  ├─ Haiku triage                    [cheap — single API call, ~$0.01]
+  │    ├─ Prompt: "Does this event match any watcher?"
+  │    ├─ Response: MATCH:<name> or NO_MATCH
+  │    └─ No tool loop, just messages.create()
+  │
+  └─ If MATCH:
+       ├─ Notify human via XMPP
+       ├─ Build action prompt from entry context
+       └─ Headless session executes action (Sonnet, with tools)
+            └─ Updates clauding.md status to done
+```
+
+**Pre-filter:** Before spending any API cost, the daemon runs cheap
+local checks. Tags are optional backtick-delimited strings in each
+entry — if present, at least one must appear in the event text
+(sender, subject, or body) for that entry to be considered. This
+eliminates most irrelevant events without an API call.
+
+**Triage:** A single Haiku call with a constrained prompt. No tools,
+no agentic loop — just "does this match?" Returns MATCH or NO_MATCH.
+Cost: ~$0.005-0.02 per call, ~5-10 calls/day with tag filtering.
+
+**Saga pattern:** The real power is chaining. After completing work,
+an agent can leave a new watcher for the next step — "I opened PR
+#47, watch for it to merge so I can update the downstream dep." The
+work creates the watchers, and the watchers create more work. This
+externalizes the agent's situational awareness into durable state
+that survives reboots and context windows.
+
+**clauding.md format:**
+
+```markdown
+## k3s-nix-snapshotter
+
+- **watch**: PR #172 in pdtpartners/nix-snapshotter gets merged
+- **tags**: `github.com`, `nix-snapshotter`, `172`
+- **since**: 2026-02-13
+- **status**: waiting
+
+### Context
+[background for a fresh session to understand the work]
+
+### Action
+[steps the headless session should execute on match]
+```
+
+Watch conditions are natural language — Haiku does the matching, not
+regex. Tags are optional pre-filter hints to avoid unnecessary API
+calls. Status transitions from `waiting` to `done YYYY-MM-DD` when
+the action completes.
+
+**Cost model:** With ~20 trusted emails/day and 1-2 active watchers,
+pre-filtering eliminates most events. ~5-10 triage calls/day at
+~$0.01 each = ~$0.10/day. Action sessions fire rarely at ~$0.30-0.50
+each. Monthly: ~$3-5.
 
 ### NixOS Integration
 
@@ -943,6 +1062,17 @@ Human can send tasks from phone. Approval works remotely.
 **Phase 3 -- Headless sessions:** DONE
 Anthropic API agent loop for fully automated sessions. Daemon streams
 progress to XMPP. No portal needed. Enables device agents.
+
+**Phase 3.1 -- Mail integration:** DONE
+IMAP IDLE push-based mail watching. Persistent connection with auto-
+reconnect. Auth verification (DKIM/SPF/DMARC) and domain trust.
+Processes unseen messages on connect.
+
+**Phase 3.2 -- Clauding evaluation:** DONE
+Event-driven evaluation of clauding.md watchers. Pre-filter chain
+(tags, trust, debounce) eliminates most events. Haiku triage for
+matching. Headless Sonnet sessions for actions. XMPP notifications
+on match. Full pipeline: email → triage → action → status update.
 
 **Phase 3.5 -- Device agent deployment:**
 Deploy daemon to managed NixOS machines (liver, gateway, etc.).

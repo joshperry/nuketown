@@ -49,6 +49,12 @@ async def resolve_workspace(
     Returns the absolute path to the project directory.
     Raises BootstrapError if the project can't be resolved.
     """
+    # Special project: _clauding runs in the agent's home directory
+    if project == "_clauding":
+        home = Path(cfg.home) if cfg.home else Path.home()
+        log.info("clauding project: using home dir %s", home)
+        return home
+
     project_path = cfg.projects_dir / project
 
     # Fast path 1: directory already exists

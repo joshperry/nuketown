@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -62,6 +63,10 @@ class Daemon:
         # Mail watcher (initialised in run() if configured)
         self._mail_task: asyncio.Task | None = None  # type: ignore[type-arg]
 
+        # Clauding evaluator (initialised in run() if clauding.md exists)
+        self._clauding = None
+        self._eval_task: asyncio.Task | None = None  # type: ignore[type-arg]
+
     async def run(self, shutdown_event: asyncio.Event) -> None:
         """Run the daemon until shutdown_event is set."""
         await self._server.start()
@@ -74,12 +79,21 @@ class Daemon:
         if self.cfg.mail:
             self._start_mail()
 
+        # Init clauding evaluator if clauding.md exists
+        clauding_path = Path.home() / ".claude" / "clauding.md"
+        if clauding_path.exists():
+            from .clauding import ClaudingEvaluator
+
+            self._clauding = ClaudingEvaluator(clauding_path)
+            log.info("clauding evaluator loaded: %s", clauding_path)
+
         log.info(
-            "daemon ready: agent=%s socket=%s xmpp=%s mail=%s",
+            "daemon ready: agent=%s socket=%s xmpp=%s mail=%s clauding=%s",
             self.cfg.agent_name,
             self.cfg.socket_path,
             self.cfg.xmpp.jid if self.cfg.xmpp else "disabled",
             self.cfg.mail.username if self.cfg.mail else "disabled",
+            "enabled" if self._clauding else "disabled",
         )
         try:
             await shutdown_event.wait()
@@ -165,7 +179,70 @@ class Daemon:
             notification.auth.summary,
         )
 
+        # Evaluate against clauding.md watchers
+        if self._clauding:
+            from .clauding import Event
+
+            event = Event(
+                source="mail",
+                sender=notification.from_addr,
+                subject=notification.subject,
+                body=notification.snippet,
+                trusted=notification.auth.trusted,
+                timestamp=time.monotonic(),
+            )
+            await self._try_evaluate(event)
+
+    async def _try_evaluate(self, event) -> None:
+        """Evaluate an event against clauding.md watchers (if not already running)."""
+        if self._eval_task and not self._eval_task.done():
+            log.debug("clauding: evaluation already in progress, skipping")
+            return
+        entries = self._clauding.get_entries()
+        if not self._clauding.check_pre_filter(event, entries):
+            return
+        self._eval_task = asyncio.create_task(self._run_evaluation(event, entries))
+
+    async def _run_evaluation(self, event, entries) -> None:
+        """Run clauding triage and dispatch action on match."""
+        try:
+            match = await self._clauding.run_triage(event, entries)
+            if not match:
+                return
+
+            log.info("clauding match: %s", match.name)
+
+            # Notify josh via XMPP
+            if self._xmpp_client and self.cfg.xmpp:
+                self._xmpp_client.send_message(
+                    "josh@6bit.com",
+                    f"[clauding] triggered: {match.name}\nEvent: {event.subject}",
+                )
+
+            # Queue action as headless task
+            from .clauding import build_action_prompt
+
+            prompt = build_action_prompt(match, event)
+            await self._handle_task(
+                {
+                    "type": "task",
+                    "project": "_clauding",
+                    "prompt": prompt,
+                    "mode": "headless",
+                    "source": "clauding",
+                    "reply_to": "josh@6bit.com",
+                }
+            )
+        except Exception:
+            log.exception("clauding evaluation failed")
+
     async def _shutdown(self) -> None:
+        if self._eval_task and not self._eval_task.done():
+            self._eval_task.cancel()
+            try:
+                await self._eval_task
+            except asyncio.CancelledError:
+                pass
         if self._mail_task and not self._mail_task.done():
             if hasattr(self, "_mail_watcher"):
                 await self._mail_watcher.stop()

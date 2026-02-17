@@ -10,6 +10,7 @@ python3Packages.buildPythonApplication {
   build-system = [ python3Packages.setuptools ];
 
   propagatedBuildInputs = [
+    python3Packages.aioimaplib
     python3Packages.anthropic
     python3Packages.slixmpp
   ];

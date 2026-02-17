@@ -463,6 +463,40 @@ let
           default = 14400;
           description = "Timeout in seconds for headless sessions (default 4h)";
         };
+
+        mail = {
+          enable = lib.mkEnableOption "IMAP IDLE mail watcher in the daemon";
+
+          host = lib.mkOption {
+            type = lib.types.str;
+            default = "";
+            description = "IMAP server hostname";
+          };
+
+          port = lib.mkOption {
+            type = lib.types.int;
+            default = 993;
+            description = "IMAP server port (TLS)";
+          };
+
+          username = lib.mkOption {
+            type = lib.types.str;
+            default = "";
+            description = "IMAP username (usually email address)";
+          };
+
+          passwordSecret = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = "sops secret name for IMAP password";
+          };
+
+          mailbox = lib.mkOption {
+            type = lib.types.str;
+            default = "INBOX";
+            description = "IMAP mailbox to watch";
+          };
+        };
       };
 
       xmpp = {
@@ -1010,6 +1044,22 @@ in
         };
       })
 
+      # ── Mail Watcher ─────────────────────────────────────────────
+      # Generate mail.toml for agents with the IMAP watcher enabled.
+      (lib.optionalAttrs (agent.daemon.enable && agent.daemon.mail.enable) {
+        xdg.configFile."nuketown/mail.toml".text = let
+          passwordPath = if agent.daemon.mail.passwordSecret != null
+            then "/run/secrets/${agent.daemon.mail.passwordSecret}"
+            else "/dev/null";
+        in ''
+          host = "${agent.daemon.mail.host}"
+          port = ${toString agent.daemon.mail.port}
+          username = "${agent.daemon.mail.username}"
+          password_file = "${passwordPath}"
+          mailbox = "${agent.daemon.mail.mailbox}"
+        '';
+      })
+
       # User-provided extraHomeConfig merges last (can override anything above)
       agent.extraHomeConfig
       ]
@@ -1147,6 +1197,12 @@ in
       }
       // lib.optionalAttrs (agent.xmpp.passwordSecret != null) {
         "${agent.xmpp.passwordSecret}" = {
+          inherit sopsFile;
+          owner = name;
+        };
+      }
+      // lib.optionalAttrs (agent.daemon.mail.enable && agent.daemon.mail.passwordSecret != null) {
+        "${agent.daemon.mail.passwordSecret}" = {
           inherit sopsFile;
           owner = name;
         };

@@ -984,21 +984,11 @@ Required egress:
 
 ### Manifest Generation (in seed)
 
-The `toKubeManifests` function lives in seed, not nuketown. It's a
-pure nix function that evaluates `nixosConfigurations` from any flake
-and projects them into k8s YAML:
-
-```nix
-seed.lib.toKubeManifests = flake: {
-  # Per nixosConfigurations entry: Namespace, Deployment,
-  # PVCs, ResourceQuota, NetworkPolicy
-  # For nuketown agents: also ServiceAccount, ConfigMap (identity.toml)
-};
-```
-
-Output is an attrset of `{ name = yamlString; }`. Can be applied
-manually (`kubectl apply`) or via ArgoCD. Seed's ArgoCD plugin wraps
-this function.
+The `toKubeManifests` function lives in seed, not nuketown. See
+section 5 for the full architecture. In brief: seed reads
+`config.seed.deploy.*` from each evaluated `nixosConfigurations`
+entry and generates the k8s Deployment, PVCs, NetworkPolicy, etc.
+Nuketown's `cloud.*` options wire through to `seed.deploy.*`.
 
 ### What Doesn't Translate
 
@@ -1129,13 +1119,11 @@ Nuketown is the generic agent framework (usable outside loom). Loom is
 the end-user distro. Seed is the compute primitive — it takes standard
 nix flake outputs and runs them. Depot is the storage primitive.
 
-Seed absorbs what was previously split across `nuketown-deploy`
-(ArgoCD reconciler, scaling controller) and a planned `cloudkit`
-(firecracker + nix-snapshotter). The key insight: `toKubeManifests`
-doesn't need to speak nuketown's language. It just evaluates standard
-`nixosConfigurations` from any flake. Nuketown agents that want cloud
-deployment already produce `nixosConfigurations` — seed consumes them
-generically. Non-agent NixOS systems work too.
+Seed provides a NixOS module (`seed.deploy.*`) and a `toKubeManifests`
+function that generates k8s manifests from any `nixosConfigurations`
+entry with `seed.deploy.enable = true`. Nuketown's `cloud.*` module
+imports seed and maps agent options to `seed.deploy.*`. Non-agent
+NixOS systems use `seed.deploy.*` directly.
 
 nuketown-chat was originally planned as a separate repo, but the
 XMPP client lives inside the daemon process and the server is managed
@@ -1246,45 +1234,99 @@ The loom module:
 
 ### One-liner
 
-Point it at any `nixosConfigurations` flake output. Get a running
-system. ArgoCD reconciles, firecracker boots, nix deduplicates.
+NixOS module + ArgoCD plugin. Add `seed.deploy` options to your
+system config, push, it's running on k8s.
 
-### What It Absorbs
+### What It Provides
 
-Seed merges two previously separate concerns:
+Seed has three parts:
 
-- **nuketown-deploy** (ArgoCD plugin, manifest generation, scaling
-  controller) — the reconciliation layer
-- **cloudkit** (firecracker + nix-snapshotter) — the compute layer
+1. **NixOS module** (`seed.nixosModules.default`) — adds `seed.deploy.*`
+   options to any `nixosConfigurations` entry. Declares the deployment
+   envelope: resources, persistence, image strategy, scaling limits.
 
-The key realization: the manifest generator (`toKubeManifests`) doesn't
-need to understand nuketown agents. It just needs to evaluate standard
-`nixosConfigurations` from any nix flake. This makes it a generic
-"flake → running NixOS" pipeline that nuketown (and anything else)
-can consume.
+2. **`toKubeManifests`** (`seed.lib.toKubeManifests`) — pure nix
+   function that evaluates `nixosConfigurations`, reads `config.seed.deploy`
+   from each one, and emits k8s manifests (Deployment, PVCs,
+   NetworkPolicy, ServiceAccount, ResourceQuota). This is what tells
+   k8s to actually run a pod with `image=nix:0:<hash>`.
 
-### Interface
+3. **ArgoCD config management plugin** — wraps `toKubeManifests` so
+   ArgoCD can call it on every git push. The plugin is the only
+   runtime component; everything else is nix evaluation.
 
-Seed consumes standard nix flake outputs:
+Seed absorbs what was previously split across `nuketown-deploy`
+(ArgoCD reconciler, scaling controller) and a planned `cloudkit`
+(firecracker + nix-snapshotter).
+
+### NixOS Module
+
+Seed's module adds deployment options to the NixOS config. Any
+`nixosConfigurations` entry that imports it gets `seed.deploy.*`:
 
 ```nix
-# Any flake with nixosConfigurations works
-{
-  nixosConfigurations.my-system = nixpkgs.lib.nixosSystem {
-    modules = [ ./configuration.nix ];
+# your flake.nix
+nixosConfigurations.my-system = nixpkgs.lib.nixosSystem {
+  modules = [
+    seed.nixosModules.default   # adds seed.deploy.* options
+    ./configuration.nix
+  ];
+};
+
+# configuration.nix
+{ ... }: {
+  seed.deploy = {
+    enable = true;
+    resources = "standard";
+    persist = [ "/var/lib/data" ];
+    imageMode = "nix-snapshotter";  # or "oci"
+    scaling.max = "large";
   };
+
+  # ... normal NixOS config ...
 }
 ```
 
+`toKubeManifests` evaluates the flake, finds every
+`nixosConfigurations` entry where `config.seed.deploy.enable = true`,
+and generates manifests for each one. The system closure becomes the
+pod image; the `seed.deploy` options become the deployment envelope
+around it.
+
+### How Nuketown Consumes Seed
+
+Nuketown's `cloud.*` agent options map directly to `seed.deploy.*`:
+
 ```
-git push → ArgoCD detects change
-  → seed plugin evaluates nixosConfigurations.<name>
-    → generates k8s manifests from the system closure
-      → system is running
+nuketown.cloud.resources = "standard"  →  seed.deploy.resources = "standard"
+nuketown.cloud.scaling.max = "large"   →  seed.deploy.scaling.max = "large"
+nuketown.agents.ada.persist            →  seed.deploy.persist
 ```
 
-No custom output schema. No nuketown-specific attributes. Just
-`nixosConfigurations` — the thing every NixOS flake already produces.
+Nuketown imports seed's module and wires its agent-specific options
+through. The agent doesn't know about seed — it just sets
+`nuketown.cloud.enable = true` and nuketown handles the mapping.
+
+Non-nuketown users set `seed.deploy.*` directly. Seed doesn't know
+or care about agents.
+
+### Agent Self-Mutation
+
+Because deployment config lives in the nix source, agents can modify
+their own execution environment through the same git→ArgoCD pipeline:
+
+```
+agent detects resource pressure
+  → edits seed.deploy.resources in nix config (via nuketown.cloud)
+  → commits, pushes (requires approval via XMPP)
+  → ArgoCD detects change
+  → seed plugin re-evaluates → new manifests with higher limits
+  → pod reschedules with more resources
+  → agent resumes from persistent state
+```
+
+The approval gate (XMPP) ensures the human signs off on resource
+changes. The git history shows exactly what changed and when.
 
 ### Two Image Paths
 
@@ -1299,8 +1341,8 @@ The nix store IS the content-addressed registry. No push/pull dance.
 Cold starts in milliseconds because the closure is already on the host.
 
 ```nix
-seed.imageMode = "oci";              # managed k8s (GKE, EKS)
-seed.imageMode = "nix-snapshotter";  # self-hosted k3s
+seed.deploy.imageMode = "oci";              # managed k8s (GKE, EKS)
+seed.deploy.imageMode = "nix-snapshotter";  # self-hosted k3s
 ```
 
 ### Why Firecracker Over Containers
@@ -1326,10 +1368,11 @@ This primitive is valuable far beyond AI agent infrastructure:
 ### Relationship to Section 3 (K8s Pod Deployment)
 
 Section 3 describes nuketown's cloud agent options (resource tiers,
-scaling, persistence mapping). Those options generate the *inputs* to
-seed — a `nixosConfigurations` entry with the right resource hints.
-Seed handles the actual deployment: manifest generation, ArgoCD sync,
-image strategy. Nuketown doesn't need to know about k8s.
+scaling, persistence mapping). Those options map to `seed.deploy.*`
+via nuketown's cloud module. Seed handles the actual deployment:
+manifest generation, ArgoCD sync, image strategy. Nuketown doesn't
+need to know about k8s — it just sets seed options and seed does
+the rest.
 
 ---
 
@@ -1342,7 +1385,7 @@ image strategy. Nuketown doesn't need to know about k8s.
 
 2. **KMS bootstrap.** Workload identity + KMS solves secrets at runtime.
    But the cluster operator needs to set up workload identity federation
-   once per cluster. Document this clearly in nuketown-deploy.
+   once per cluster. Document this clearly in seed.
 
 3. **Agent networking.** If ada is on your laptop with a serial port and
    vox is in a cluster, how do they collaborate beyond git? XMPP handles

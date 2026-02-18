@@ -683,8 +683,9 @@ Push to container registry (Artifact Registry, GHCR, etc.).
 
 nix-snapshotter is not viable on managed GKE (cannot customize
 containerd plugins). It remains an option for self-hosted k3s on
-NixOS once the k3s patch is rebuilt. The k3s integration patch
-broke against nixpkgs k3s 1.34.3 (confirmed on signi 2026-02-12).
+NixOS — see section 5 (Cloudkit) for the firecracker+nix-snapshotter
+path. The k3s integration patch broke against nixpkgs k3s 1.34.3
+(confirmed on signi 2026-02-12).
 
 ```nix
 nuketown.cloud.imageMode = "oci";  # default
@@ -1106,17 +1107,189 @@ approval gate ensures all changes go through the front door.
 
 ---
 
-## Repository Boundaries
+## Repository Boundaries — Loomtex Org
+
+All repos under the `loomtex` organization. Each is independently
+useful but they compose into a product ecosystem.
 
 | Repo | Role | Scope |
 |------|------|-------|
-| **nuketown** (this repo) | Declares | Module options, `toKubeManifests`, identity, daemon package |
-| **nuketown-deploy** (new) | Reconciles | ArgoCD plugin, scaling controller, cluster docs |
+| **loom** | Distro | NixOS distribution — OOTB kiosk, setup flow, Ada |
+| **nuketown** (this repo) | Framework | Agent module, identity, daemon, `toKubeManifests` |
+| **cloudkit** | Platform | NixOS derivation → running firecracker microVM on k8s |
+| **depot** | Git hosting | SSH-only git server for machine config backup |
+| **nuketown-deploy** | Reconciler | ArgoCD plugin, scaling controller, cluster docs |
+
+Nuketown is the generic agent framework (usable outside loom). Loom is
+the end-user distro. Cloudkit is the compute primitive. Depot is the
+storage primitive.
 
 nuketown-chat was originally planned as a separate repo, but the
 XMPP client lives inside the daemon process and the server is managed
 externally (mynix/liver). The slixmpp integration is part of the
 daemon package in nuketown.
+
+### The Flywheel
+
+Loom drives adoption → depot stores configs → cloudkit runs services →
+each layer feeds the next. The config repos (with consent) become
+training signal for better system configuration. The moat is the
+flywheel, not the code.
+
+---
+
+## 4. Depot — Git Hosting for Machine Configs
+
+### One-liner
+
+SSH-only git server where each Loom machine backs up its NixOS config
+automatically. No accounts. No web UI. Just SSH keys.
+
+### How It Works
+
+Each Loom machine gets a repo named by its `machine-id`. Ada commits
+after every `nixos-rebuild switch`. The human's SSH key provides
+independent access for recovery.
+
+```
+depot.loomtex.com/
+├── a1b2c3d4e5f6/   # machine-id repo
+│   ├── flake.nix
+│   ├── configuration.nix
+│   ├── CLAUDE.md
+│   └── .authorized_keys
+├── f7e8d9c0b1a2/
+│   └── ...
+```
+
+### Auth Model
+
+No accounts. No passwords. No database. Just SSH keys.
+
+- **First push**: SSH key auto-creates a repo named by machine-id.
+  That key becomes the repo owner.
+- **ACL**: `.authorized_keys` file in the repo root. Standard
+  `authorized_keys` format. Ada commits it like any other config change.
+- **Human access**: Ada adds the human's SSH key to `.authorized_keys`
+  during setup. The human can always clone/push with their personal key.
+
+```
+# .authorized_keys
+ssh-ed25519 AAAA... ada@a1b2c3d4e5f6
+ssh-ed25519 AAAA... josh@personal
+```
+
+Adding access is just a commit — auditable, reversible. Ada can do
+`git log .authorized_keys` to show the human who has access.
+
+### Recovery Model
+
+1. **Normal**: Ada commits and pushes with her sops-managed key.
+   Human has read/write via their personal SSH key.
+2. **Machine dies**: Human clones from depot with their personal key.
+   `nix install` from the flake reproduces the entire system.
+3. **Keys lost**: Fork the old machine-id repo under a new machine-id
+   with new identities. Config history preserved, just re-keyed.
+
+The declarative config IS the backup. No images, no snapshots — just
+a git repo that reproduces the entire system.
+
+### Security
+
+- Ada's sops private key never leaves the machine — depot only needs
+  her public key for push auth.
+- If a machine is compromised, revoke its key on depot (remove from
+  `.authorized_keys` of any repos it has access to). Attacker can't
+  push anymore.
+- The config itself isn't secret (just nix). Only the sops-encrypted
+  secrets file contains sensitive data, and it's encrypted at rest in
+  the repo.
+
+### Economics
+
+Nix configs are tiny text. Diffs well, compresses well, never has
+large binaries. Thousands of machine configs is megabytes of storage.
+Free tier for Loom users is essentially zero marginal cost.
+
+### Loom Module Integration
+
+```nix
+loom.depot = {
+  enable = true;
+  remote = "depot.loomtex.com";  # default
+  # machine-id and SSH keys configured automatically
+};
+```
+
+The loom module:
+- Adds `depot.loomtex.com` as a git remote in the system project
+- Configures a post-switch hook that auto-commits and pushes
+- Adds the human's SSH key to `.authorized_keys` during setup
+- Ada's SSH key (from sops/nuketown) is the repo owner key
+
+---
+
+## 5. Cloudkit — NixOS to Running MicroVM
+
+### One-liner
+
+Give it a NixOS derivation, get a running firecracker microVM in
+seconds. Nix store as the content-addressed image registry.
+
+### Why Firecracker, Not Containers
+
+Containers share a kernel and fake isolation with namespaces.
+Firecracker microVMs boot a real Linux kernel in ~125ms with actual
+hardware-level isolation (KVM). Combined with nix-snapshotter, you
+get container-speed deploys with VM-level security.
+
+### Architecture
+
+```
+NixOS system closure (nix build)
+  → nix-snapshotter prepares rootfs from store paths
+    → firecracker boots microVM with that rootfs
+      → running NixOS system in ~200ms
+```
+
+The nix store IS the content-addressed registry. No "build image,
+push to registry, pull, unpack" dance. Store paths are shared via
+nix deduplication. Cold starts measured in milliseconds because the
+closure is already on the host.
+
+### Product Potential Beyond Agents
+
+This primitive is valuable far beyond AI agent infrastructure:
+
+- **Dev environments**: `nix build` → running microVM with your full
+  tool chain. Isolated, disposable, reproducible.
+- **CI/CD**: each job gets a hermetic NixOS microVM, not a container
+  pretending to be isolated.
+- **Preview deployments**: PR triggers a firecracker microVM running
+  the full system, not a docker-compose approximation.
+- **Edge/serverless**: nix closures as the deployment unit. Firecracker
+  cold starts + nix dedup = fast, efficient, auditable.
+
+### K8s Integration
+
+k8s handles scheduling, networking, service discovery. Cloudkit
+replaces the container runtime with firecracker+nix-snapshotter.
+Existing k8s tooling, monitoring, autoscaling all still work.
+
+Loom's Ada instances become just one workload type on this platform.
+
+### Relationship to Section 3 (K8s Pod Deployment)
+
+Section 3 describes the OCI image path (`dockerTools.buildImage`) for
+managed k8s where you can't customize containerd (GKE, EKS). Cloudkit
+is the fast path for self-hosted k8s (k3s on NixOS) where
+nix-snapshotter is available. Same k8s API, same ArgoCD flow —
+different image strategy underneath.
+
+```nix
+nuketown.cloud.imageMode = "oci";            # managed k8s (GKE, EKS)
+nuketown.cloud.imageMode = "nix-snapshotter"; # self-hosted k3s
+```
 
 ---
 
@@ -1167,5 +1340,6 @@ Nuketown Cloud would be the first tool that:
 
 ---
 
-*The town is disposable. The agents run everywhere — your desk, your
-servers, the cloud. You just chat with them.*
+*The town is disposable. The configs survive in depot. The compute
+runs on cloudkit. The agents rebuild from nix — your desk, your
+servers, the cloud. You just talk to them.*

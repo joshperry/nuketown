@@ -662,15 +662,16 @@ Generates a systemd user service under the agent account:
 
 The NixOS configuration already declares everything about the agent's
 environment. The only thing missing is a thin translation layer that
-turns that declaration into something a cluster can run.
+turns that declaration into something a cluster can run. That layer
+is seed.
 
-You add `cloud.enable = true` to an agent, push to a branch, and a
-cluster schedules it:
+You add `cloud.enable = true` to an agent, push to a branch, and seed
+schedules it:
 
 ```
 git push origin main
   -> ArgoCD detects change
-    -> runs nuketown plugin (nix eval -> k8s YAML)
+    -> seed plugin evaluates nixosConfigurations (nix eval -> k8s YAML)
     -> diffs manifests vs cluster state
     -> applies changes (create / update / delete pods)
     -> agent is live
@@ -683,7 +684,7 @@ Push to container registry (Artifact Registry, GHCR, etc.).
 
 nix-snapshotter is not viable on managed GKE (cannot customize
 containerd plugins). It remains an option for self-hosted k3s on
-NixOS — see section 5 (Cloudkit) for the firecracker+nix-snapshotter
+NixOS — see section 5 (Seed) for the firecracker+nix-snapshotter
 path. The k3s integration patch broke against nixpkgs k3s 1.34.3
 (confirmed on signi 2026-02-12).
 
@@ -728,9 +729,8 @@ picks sensible defaults for everything else.
 
 Tiers are defined in `nuketown.cloud.tiers` by the cluster admin.
 Each tier declares the resources and scheduling constraints for that
-class of workload. `toKubeManifests` uses these definitions to
-generate pod resource requests/limits, node selectors, and
-tolerations.
+class of workload. Seed uses these definitions to generate pod
+resource requests/limits, node selectors, and tolerations.
 
 ```nix
 nuketown.cloud.tiers = {
@@ -982,19 +982,23 @@ Required egress:
 - XMPP server (6bit.com, port 5222)
 - Nix caches (cache.nixos.org, port 443)
 
-### `toKubeManifests`
+### Manifest Generation (in seed)
 
-Pure nix function that projects agent config into k8s YAML:
+The `toKubeManifests` function lives in seed, not nuketown. It's a
+pure nix function that evaluates `nixosConfigurations` from any flake
+and projects them into k8s YAML:
 
 ```nix
-nuketown.lib.toKubeManifests = config: {
-  # Per agent: Namespace, ServiceAccount, Deployment,
-  # PVCs, ResourceQuota, NetworkPolicy, ConfigMap (identity.toml)
+seed.lib.toKubeManifests = flake: {
+  # Per nixosConfigurations entry: Namespace, Deployment,
+  # PVCs, ResourceQuota, NetworkPolicy
+  # For nuketown agents: also ServiceAccount, ConfigMap (identity.toml)
 };
 ```
 
 Output is an attrset of `{ name = yamlString; }`. Can be applied
-manually (`kubectl apply`) or via ArgoCD.
+manually (`kubectl apply`) or via ArgoCD. Seed's ArgoCD plugin wraps
+this function.
 
 ### What Doesn't Translate
 
@@ -1010,14 +1014,14 @@ manually (`kubectl apply`) or via ArgoCD.
 ## ArgoCD Integration
 
 ArgoCD replaces the entire custom reconciliation layer. The only
-nuketown-specific code is a config management plugin that translates
-nix -> k8s YAML.
+custom code is seed's config management plugin that translates
+nix flake outputs → k8s YAML.
 
 ### How ArgoCD works here
 
 1. **Watch** — ArgoCD polls or receives webhook from GitHub on push
-2. **Evaluate** — ArgoCD runs the nuketown plugin, which calls
-   `nix eval` to discover agents with `cloud.enable = true`
+2. **Evaluate** — ArgoCD runs the seed plugin, which calls
+   `nix eval` to discover `nixosConfigurations` entries
 3. **Generate** — Plugin emits k8s manifests (Deployments, PVCs,
    ServiceAccounts, ResourceQuotas)
 4. **Diff** — ArgoCD compares generated manifests against cluster state
@@ -1080,14 +1084,16 @@ Deploy daemon to managed NixOS machines (liver, gateway, etc.).
 Pre-approved sudo commands for routine ops. XMPP identity per device.
 First real test of the "chat with your infrastructure" model.
 
-**Phase 4 -- K8s deployment:**
-`nuketown.cloud` options, `toKubeManifests`, OCI image builds. Pod
-runs daemon as entrypoint. Secrets via workload identity. PVCs for
-persistence.
+**Phase 4 -- Seed + K8s deployment:**
+Seed evaluates `nixosConfigurations` → k8s manifests. OCI image builds
+for managed k8s; nix-snapshotter + firecracker for self-hosted k3s.
+Pod runs daemon as entrypoint. Secrets via workload identity. PVCs for
+persistence. `nuketown.cloud` options in nuketown generate the
+`nixosConfigurations` that seed consumes.
 
 **Phase 5 -- ArgoCD:**
-Config management plugin wraps `toKubeManifests`. Push nuketown nix
-config -> ArgoCD syncs manifests. Full gitops.
+Seed's config management plugin wraps `toKubeManifests`. Push any
+flake with `nixosConfigurations` → ArgoCD syncs manifests. Full gitops.
 
 **Phase 6 -- Orchestration UX:**
 Resource scaling controller. Idle timeout auto-downscaling. Node pool
@@ -1115,14 +1121,21 @@ useful but they compose into a product ecosystem.
 | Repo | Role | Scope |
 |------|------|-------|
 | **loom** | Distro | NixOS distribution — OOTB kiosk, setup flow, Ada |
-| **nuketown** (this repo) | Framework | Agent module, identity, daemon, `toKubeManifests` |
-| **cloudkit** | Platform | NixOS derivation → running firecracker microVM on k8s |
+| **nuketown** (this repo) | Framework | Agent module, identity, daemon, XMPP, approval |
+| **seed** | Compute | Any `nixosConfigurations` flake output → running system |
 | **depot** | Git hosting | SSH-only git server for machine config backup |
-| **nuketown-deploy** | Reconciler | ArgoCD plugin, scaling controller, cluster docs |
 
 Nuketown is the generic agent framework (usable outside loom). Loom is
-the end-user distro. Cloudkit is the compute primitive. Depot is the
-storage primitive.
+the end-user distro. Seed is the compute primitive — it takes standard
+nix flake outputs and runs them. Depot is the storage primitive.
+
+Seed absorbs what was previously split across `nuketown-deploy`
+(ArgoCD reconciler, scaling controller) and a planned `cloudkit`
+(firecracker + nix-snapshotter). The key insight: `toKubeManifests`
+doesn't need to speak nuketown's language. It just evaluates standard
+`nixosConfigurations` from any flake. Nuketown agents that want cloud
+deployment already produce `nixosConfigurations` — seed consumes them
+generically. Non-agent NixOS systems work too.
 
 nuketown-chat was originally planned as a separate repo, but the
 XMPP client lives inside the daemon process and the server is managed
@@ -1131,7 +1144,7 @@ daemon package in nuketown.
 
 ### The Flywheel
 
-Loom drives adoption → depot stores configs → cloudkit runs services →
+Loom drives adoption → depot stores configs → seed runs services →
 each layer feeds the next. The config repos (with consent) become
 training signal for better system configuration. The moat is the
 flywheel, not the code.
@@ -1229,33 +1242,73 @@ The loom module:
 
 ---
 
-## 5. Cloudkit — NixOS to Running MicroVM
+## 5. Seed — Flake to Running System
 
 ### One-liner
 
-Give it a NixOS derivation, get a running firecracker microVM in
-seconds. Nix store as the content-addressed image registry.
+Point it at any `nixosConfigurations` flake output. Get a running
+system. ArgoCD reconciles, firecracker boots, nix deduplicates.
 
-### Why Firecracker, Not Containers
+### What It Absorbs
+
+Seed merges two previously separate concerns:
+
+- **nuketown-deploy** (ArgoCD plugin, manifest generation, scaling
+  controller) — the reconciliation layer
+- **cloudkit** (firecracker + nix-snapshotter) — the compute layer
+
+The key realization: the manifest generator (`toKubeManifests`) doesn't
+need to understand nuketown agents. It just needs to evaluate standard
+`nixosConfigurations` from any nix flake. This makes it a generic
+"flake → running NixOS" pipeline that nuketown (and anything else)
+can consume.
+
+### Interface
+
+Seed consumes standard nix flake outputs:
+
+```nix
+# Any flake with nixosConfigurations works
+{
+  nixosConfigurations.my-system = nixpkgs.lib.nixosSystem {
+    modules = [ ./configuration.nix ];
+  };
+}
+```
+
+```
+git push → ArgoCD detects change
+  → seed plugin evaluates nixosConfigurations.<name>
+    → generates k8s manifests from the system closure
+      → system is running
+```
+
+No custom output schema. No nuketown-specific attributes. Just
+`nixosConfigurations` — the thing every NixOS flake already produces.
+
+### Two Image Paths
+
+**OCI (managed k8s — GKE, EKS, AKS):**
+System closure → `dockerTools.buildImage` → push to registry → k8s
+pulls and runs. Works anywhere but has the build/push/pull overhead.
+
+**nix-snapshotter (self-hosted k3s on NixOS):**
+System closure → nix-snapshotter prepares rootfs from store paths →
+firecracker boots microVM with that rootfs → running NixOS in ~200ms.
+The nix store IS the content-addressed registry. No push/pull dance.
+Cold starts in milliseconds because the closure is already on the host.
+
+```nix
+seed.imageMode = "oci";              # managed k8s (GKE, EKS)
+seed.imageMode = "nix-snapshotter";  # self-hosted k3s
+```
+
+### Why Firecracker Over Containers
 
 Containers share a kernel and fake isolation with namespaces.
 Firecracker microVMs boot a real Linux kernel in ~125ms with actual
 hardware-level isolation (KVM). Combined with nix-snapshotter, you
 get container-speed deploys with VM-level security.
-
-### Architecture
-
-```
-NixOS system closure (nix build)
-  → nix-snapshotter prepares rootfs from store paths
-    → firecracker boots microVM with that rootfs
-      → running NixOS system in ~200ms
-```
-
-The nix store IS the content-addressed registry. No "build image,
-push to registry, pull, unpack" dance. Store paths are shared via
-nix deduplication. Cold starts measured in milliseconds because the
-closure is already on the host.
 
 ### Product Potential Beyond Agents
 
@@ -1270,26 +1323,13 @@ This primitive is valuable far beyond AI agent infrastructure:
 - **Edge/serverless**: nix closures as the deployment unit. Firecracker
   cold starts + nix dedup = fast, efficient, auditable.
 
-### K8s Integration
-
-k8s handles scheduling, networking, service discovery. Cloudkit
-replaces the container runtime with firecracker+nix-snapshotter.
-Existing k8s tooling, monitoring, autoscaling all still work.
-
-Loom's Ada instances become just one workload type on this platform.
-
 ### Relationship to Section 3 (K8s Pod Deployment)
 
-Section 3 describes the OCI image path (`dockerTools.buildImage`) for
-managed k8s where you can't customize containerd (GKE, EKS). Cloudkit
-is the fast path for self-hosted k8s (k3s on NixOS) where
-nix-snapshotter is available. Same k8s API, same ArgoCD flow —
-different image strategy underneath.
-
-```nix
-nuketown.cloud.imageMode = "oci";            # managed k8s (GKE, EKS)
-nuketown.cloud.imageMode = "nix-snapshotter"; # self-hosted k3s
-```
+Section 3 describes nuketown's cloud agent options (resource tiers,
+scaling, persistence mapping). Those options generate the *inputs* to
+seed — a `nixosConfigurations` entry with the right resource hints.
+Seed handles the actual deployment: manifest generation, ArgoCD sync,
+image strategy. Nuketown doesn't need to know about k8s.
 
 ---
 
@@ -1331,15 +1371,15 @@ nuketown.cloud.imageMode = "nix-snapshotter"; # self-hosted k3s
 | Comin | Pull-based GitOps for NixOS | VM-based, no provisioning |
 | Terraform + k8s | IaC for cluster resources | Two languages, no nix integration |
 
-Nuketown Cloud would be the first tool that:
-- Uses NixOS configuration as the sole source of truth for agent
-  environments *and* their cloud scheduling
-- Translates nix declarations into k8s manifests
-- Treats infrastructure scaling as a conversation between agent and human
-- Provides git-push-to-running-agent as a workflow
+Seed + nuketown would be the first stack that:
+- Uses standard `nixosConfigurations` as the sole input to cloud deployment
+- Translates nix flake outputs into k8s manifests (seed)
+- Treats infrastructure scaling as a conversation between agent and human (nuketown)
+- Provides git-push-to-running-system as a workflow
+- Works for any NixOS system, not just agents
 
 ---
 
 *The town is disposable. The configs survive in depot. The compute
-runs on cloudkit. The agents rebuild from nix — your desk, your
-servers, the cloud. You just talk to them.*
+runs on seed. The agents rebuild from nix — your desk, your servers,
+the cloud. You just talk to them.*

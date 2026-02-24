@@ -343,7 +343,7 @@ let
       portal = {
         enable = lib.mkOption {
           type = lib.types.bool;
-          default = false;
+          default = name == "ada";
           description = ''
             Generate a tmux portal command for this agent.
             Opens a side-by-side tmux window with your shell on the left
@@ -851,7 +851,15 @@ in
               path="$1"
               shift
               session=$(basename "$path")
-              exec /run/current-system/sw/bin/machinectl shell ${name}@ ${pkgs.bash}/bin/bash -l -c "mkdir -p '$path' && cd '$path' && TMUX= exec ${pkgs.tmux}/bin/tmux -L portal-${name} new-session -As '$session' \\; set -g status off \\; send-keys '${agent.portal.command} $*' C-m"
+              exec /run/current-system/sw/bin/machinectl shell ${name}@ ${pkgs.bash}/bin/bash -l -c "
+                mkdir -p '$path' && cd '$path'
+                tmux=${pkgs.tmux}/bin/tmux
+                if TMUX= \$tmux -L portal-${name} has-session -t '$session' 2>/dev/null; then
+                  exec TMUX= \$tmux -L portal-${name} attach-session -t '$session'
+                else
+                  exec TMUX= \$tmux -L portal-${name} new-session -s '$session' \\; set -g status off \\; send-keys '${agent.portal.command} $*' C-m
+                fi
+              "
             '';
           in
           pkgs.writeShellScriptBin "portal-${name}" ''

@@ -39,12 +39,9 @@
 
       sudo.enable = true;
 
-      portal = {
-        enable = true;
-        # Default command is claude-code via nix store path.
-        # Replace with shell agent later:
-        # command = "${pkgs.ada-shell}/bin/ada-shell";
-      };
+      # portal.enable defaults to true for ada.
+      # Override portal.command to replace the default claude-code launcher:
+      # portal.command = "${pkgs.ada-shell}/bin/ada-shell";
 
       devices = [
         {

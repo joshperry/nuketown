@@ -102,16 +102,27 @@ home-manager.users.ada = {
 
 Different agents get different tools. A research agent doesn't need `claude-code`. A CI agent doesn't need `ripgrep`. The environment matches the role.
 
-### Residents are online
+### You work with residents
 
-Agents aren't shells you log into. They're systemd user services connected to a chat platform. You message them. They might already be working on something.
+The portal is how you sit down with an agent. `portal-ada` opens a tmux split — agent working in the top pane, your shell in the bottom, same directory. You see what she's doing. You can jump in.
 
-- **Always available.** Open a chat, start talking.
-- **Persistent history.** Conversations live in the chat service, not a terminal buffer.
-- **Device-independent.** Message from your laptop, your phone, SSH on the train.
-- **Asynchronous.** "Look into the UART DMA issue." Close the laptop. Review the commits tomorrow.
+```
+┌─────────────────────────────────────────┐
+│ ada: claude-code                        │
+│                                         │
+│  Reading src/pid/roll.c...              │
+│  The P gain is fixed at 45. At high     │
+│  throttle, effective gain climbs.       │
+│                                         │
+├─────────────────────────────────────────┤
+│ josh: ~/dev/rotorflight $ git log -1    │
+│ a3f1c9e Add throttle-scaled P gain      │
+└─────────────────────────────────────────┘
+```
 
-The chat service is the face. The Unix user is the hands.
+The portal uses `machinectl shell` to get a proper login session — full PAM environment, home-manager profile, correct PATH. It's a real collaboration workspace, not a `sudo -u` hack.
+
+For async work, agents connect to a chat service. Message from your laptop, your phone, wherever. "Look into the UART DMA issue." Close the laptop. Review the commits tomorrow. The agent is a persistent service, not a terminal session.
 
 ### The town resets every round
 
@@ -193,6 +204,86 @@ services.udev.extraRules = ''
 
 Ada can flash an STM32 over serial. She can't touch your Yubikey. The access is declared in nix, enforced by the kernel, and specific to the device vendor/product. Plug it in and the ACL appears. Unplug it and there's nothing to access.
 
+## Using the Module
+
+All of the above — users, secrets, home-manager environments, btrfs rollback, persistence, udev rules — is what nuketown distills your config down to. Here's what you actually write:
+
+```nix
+# flake.nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nuketown.url = "github:nuketownada/nuketown";
+  };
+
+  outputs = { nixpkgs, nuketown, ... }: {
+    nixosConfigurations.signi = nixpkgs.lib.nixosSystem {
+      modules = [
+        nuketown.nixosModules.default
+        ./configuration.nix
+      ];
+    };
+  };
+}
+```
+
+```nix
+# configuration.nix
+nuketown = {
+  enable = true;
+  domain = "signi.local";
+  btrfsDevice = "38b243a0-c875-4758-8998-cc6c6a4c451e";
+  sopsFile = ./secrets/agents.yaml;
+  humanUser = "josh";
+
+  agents.ada = {
+    enable = true;
+    uid = 1100;
+    role = "software";
+    description = ''
+      Software collaborator on signi. Works with josh on embedded
+      systems, NixOS configuration, and web projects.
+    '';
+
+    packages = with pkgs; [
+      unstable.claude-code
+      gcc-arm-embedded
+      stm32flash
+    ];
+
+    persist = [ "projects" ".config/claude" ];
+
+    secrets.sshKey = "ada/ssh-key";
+    secrets.gpgKey = "ada/gpg-key";
+
+    sudo.enable = true;
+
+    devices = [
+      { subsystem = "tty"; attrs = { idVendor = "0483"; idProduct = "5740"; }; }
+      { subsystem = "usb"; attrs = { product = "STM32  BOOTLOADER"; }; }
+    ];
+  };
+};
+```
+
+That's the whole agent. The module generates the user account, home-manager config, sops secret paths, udev rules, sudo shim, portal commands, btrfs rollback service, and impermanence binds shown in the sections above.
+
+A minimal agent is even shorter:
+
+```nix
+nuketown.agents.vox = {
+  enable = true;
+  uid = 1101;
+  role = "research";
+  description = "Research agent. Reads papers, summarizes findings.";
+  packages = with pkgs; [ python3 ];
+  persist = [ "projects" "notes" ];
+  secrets.sshKey = "vox/ssh-key";
+};
+```
+
+No hardware access, no sudo. Just a user with an identity and some persisted directories. Add `portal.enable = true` to get a `portal-vox` workspace command.
+
 ## Scaling the Town
 
 ### More residents
@@ -242,7 +333,7 @@ Agents in the same chat room can talk to each other. Or not — you set the room
 
 ## The Conversation
 
-The reason the agents are on a chat service and not behind a CLI:
+Whether it's a portal session or a chat message, the interaction is the same — a conversation:
 
 ```
 josh: The roll axis oscillates at high throttle.
@@ -272,7 +363,7 @@ ada:  Could be prop wash on one side, but let's rule out software
 
 That's not a task runner. That's a colleague. She asked a clarifying question before writing code. She considered a non-software explanation. She proposed an approach and waited for agreement.
 
-The chat is the natural interface for this. Not a prompt. Not a command. A conversation.
+Portal or chat, the dynamic is the same. A conversation, not a command.
 
 ## What Nuketown Is Not
 

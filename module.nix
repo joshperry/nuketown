@@ -343,7 +343,7 @@ let
       portal = {
         enable = lib.mkOption {
           type = lib.types.bool;
-          default = name == "ada";
+          default = false;
           description = ''
             Generate a tmux portal command for this agent.
             Opens a side-by-side tmux window with your shell on the left

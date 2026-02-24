@@ -257,6 +257,7 @@ nuketown = {
     secrets.gpgKey = "ada/gpg-key";
 
     sudo.enable = true;
+    portal.enable = true;
 
     devices = [
       { subsystem = "tty"; attrs = { idVendor = "0483"; idProduct = "5740"; }; }

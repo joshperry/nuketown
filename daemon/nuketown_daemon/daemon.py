@@ -179,6 +179,9 @@ class Daemon:
             notification.auth.summary,
         )
 
+        # Auto-accept GitHub invites
+        await self._try_accept_invite(notification)
+
         # Evaluate against clauding.md watchers
         if self._clauding:
             from .clauding import Event
@@ -198,6 +201,22 @@ class Daemon:
                 timestamp=time.monotonic(),
             )
             await self._try_evaluate(event)
+
+    async def _try_accept_invite(self, notification) -> None:
+        """Detect and auto-accept GitHub invites, notify via XMPP."""
+        from .github import handle_invite
+
+        try:
+            result = await handle_invite(notification)
+        except Exception:
+            log.exception("github invite handling failed")
+            return
+
+        if result and self._xmpp_client:
+            self._xmpp_client.send_message(
+                "josh@6bit.com",
+                f"[github] {result}",
+            )
 
     async def _try_evaluate(self, event) -> None:
         """Evaluate an event against clauding.md watchers (if not already running)."""

@@ -46,14 +46,11 @@ let
       exit 1
     fi
 
-    echo "Requesting approval to run: $COMMAND" >&2
-
     # Send request to daemon and wait for response
     # Username:command format — usernames can't contain colons on Unix
     RESPONSE=$(printf "%s\n\n" "$REQUESTING_USER:$COMMAND" | ${pkgs.socat}/bin/socat STDIO,ignoreeof UNIX-CONNECT:"$SOCKET_PATH" || echo "ERROR")
 
     if [ "$RESPONSE" = "APPROVED" ]; then
-      echo "Approved! Executing command..." >&2
       exec ${pkgs.sudo}/bin/sudo "$@"
     elif [ "$RESPONSE" = "DENIED" ]; then
       echo "Request denied." >&2
@@ -142,7 +139,6 @@ let
       ${pkgs.socat}/bin/socat STDIO,ignoreeof UNIX-CONNECT:"$SOCKET_PATH" || echo "ERROR")
 
     if [ "$RESPONSE" = "APPROVED" ]; then
-      echo "Approved. Executing..." >&2
       /run/wrappers/bin/sudo /run/current-system/sw/bin/sudoex-run "$@"
       RC=$?
       exit $RC

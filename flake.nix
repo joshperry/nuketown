@@ -337,6 +337,32 @@
           };
         };
 
+        # ── Demo VM ─────────────────────────────────────────────────
+        # Self-contained graphical qcow2 buildable on any Linux with
+        # Nix installed (no host /nix/store mounting via 9p). See
+        # ./demo/configuration.nix and ./demo/README.md.
+        demo-vm = nixpkgs.lib.nixosSystem {
+          system = "x86_64-linux";
+          modules = [
+            ./module.nix
+            home-manager.nixosModules.home-manager
+            sops-nix.nixosModules.sops
+            impermanence.nixosModules.impermanence
+            ({ ... }: {
+              nixpkgs.overlays = [
+                (final: prev: {
+                  unstable = import nixpkgs-unstable {
+                    inherit (final) system;
+                    config.allowUnfree = true;
+                  };
+                })
+              ];
+              nixpkgs.config.allowUnfree = true;
+            })
+            ./demo/configuration.nix
+          ];
+        };
+
         # Hardware access test VM
         test-hardware = mkTestVM {
           name = "test-hardware";
@@ -395,6 +421,7 @@
       apps = forAllSystems (system:
         let
           pkgs = pkgsFor system;
+          lib = pkgs.lib;
 
           # Package all test files together
           testPackage = pkgs.runCommand "nuketown-tests" {} ''
@@ -417,6 +444,63 @@
             export NUKETOWN_TEST_RUNNER="${testRunner}"
             exec ${pkgs.bash}/bin/bash ${./vm-manager.sh} "$@"
           '';
+
+          # One-shot demo runner: build the qcow2, copy it to a writable
+          # scratch path, boot it under qemu (KVM if available) in a
+          # graphical window. Designed for Ubuntu hosts with only `nix`
+          # installed — qemu comes from the nix store.
+          demoVm =
+            if system == "x86_64-linux"
+            then self.nixosConfigurations.demo-vm.config.system.build.qcow
+            else null;
+          demoRunner = pkgs.writeShellScript "nuketown-demo" ''
+            set -euo pipefail
+
+            ${lib.optionalString (system != "x86_64-linux") ''
+              echo "The demo VM is only built for x86_64-linux." >&2
+              echo "You are on ${system}." >&2
+              exit 1
+            ''}
+
+            export PATH="${lib.makeBinPath [ pkgs.qemu pkgs.coreutils ]}:$PATH"
+
+            STATE_DIR="''${XDG_STATE_HOME:-$HOME/.local/state}/nuketown-demo"
+            mkdir -p "$STATE_DIR"
+            DISK="$STATE_DIR/demo.qcow2"
+
+            if [ ! -f "$DISK" ]; then
+              echo ">>> First run: copying read-only image from the nix store"
+              echo "    source: ${demoVm}/nixos.qcow2"
+              echo "    target: $DISK"
+              cp --reflink=auto "${demoVm}/nixos.qcow2" "$DISK"
+              chmod u+w "$DISK"
+            else
+              echo ">>> Reusing existing disk at $DISK"
+              echo "    (delete it to start over)"
+            fi
+
+            ACCEL_ARGS=()
+            if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+              echo ">>> KVM available — using hardware acceleration"
+              ACCEL_ARGS=(-enable-kvm -cpu host)
+            else
+              echo ">>> No KVM (or no access to /dev/kvm) — using TCG (slow)"
+              echo "    On Ubuntu: sudo usermod -aG kvm \"$USER\" then log out/in"
+              ACCEL_ARGS=(-cpu max)
+            fi
+
+            exec qemu-system-x86_64 \
+              "''${ACCEL_ARGS[@]}" \
+              -m 4096 \
+              -smp 2 \
+              -drive file="$DISK",if=virtio,format=qcow2 \
+              -netdev user,id=net0,hostfwd=tcp::2222-:22 \
+              -device virtio-net-pci,netdev=net0 \
+              -vga virtio \
+              -display gtk,grab-on-hover=on \
+              -name "Nuketown demo" \
+              "$@"
+          '';
         in {
           # Run tests
           test = {
@@ -428,6 +512,12 @@
           vm = {
             type = "app";
             program = toString vmManager;
+          };
+
+          # Boot the demo VM in a graphical window
+          demo = {
+            type = "app";
+            program = toString demoRunner;
           };
         }
       );
@@ -451,6 +541,11 @@
           pkgs = pkgsFor system;
         in {
           nuketown-daemon = pkgs.callPackage ./daemon.nix {};
+        }
+        // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          # Self-contained qcow2 of the demo VM. Build on any Linux
+          # with Nix:  nix build .#demo-vm  →  result/nixos.qcow2
+          demo-vm = self.nixosConfigurations.demo-vm.config.system.build.qcow;
         }
       );
     };

@@ -37,14 +37,19 @@ nix run github:joshperry/nuketown#demo
 ```
 
 That builds the qcow2 (first run takes a while — pulls XFCE + the rest of
-the closure), copies it to `~/.local/state/nuketown-demo/demo.qcow2`,
+the closure), copies it to `~/.local/state/nuketown-demo/demo-<hash>.qcow2`,
 and opens a QEMU window with the VM booting.
 
-To start fresh next time, delete the scratch disk:
+**To pick up a newer commit of the demo**, pass `--refresh` — `nix run`
+otherwise caches the flake metadata for an hour:
 
 ```bash
-rm ~/.local/state/nuketown-demo/demo.qcow2
+nix run --refresh github:joshperry/nuketown#demo
 ```
+
+A new image build automatically gets a new writable disk (named after
+the image's store hash) so you always boot the latest. Old disks are
+left in `~/.local/state/nuketown-demo/` and can be deleted manually.
 
 ### Alternative: build the image and run it your own way
 

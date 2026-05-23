@@ -466,17 +466,31 @@
 
             STATE_DIR="''${XDG_STATE_HOME:-$HOME/.local/state}/nuketown-demo"
             mkdir -p "$STATE_DIR"
-            DISK="$STATE_DIR/demo.qcow2"
+
+            # Name the writable disk after the source image's nix store
+            # hash. New image build → new disk → user always boots the
+            # latest. Old disks are left behind for manual cleanup
+            # (preserves any state from prior demos).
+            SOURCE="${demoVm}/nixos.qcow2"
+            STORE_TAG=$(basename "$(dirname "$SOURCE")" | cut -d- -f1)
+            DISK="$STATE_DIR/demo-$STORE_TAG.qcow2"
 
             if [ ! -f "$DISK" ]; then
-              echo ">>> First run: copying read-only image from the nix store"
-              echo "    source: ${demoVm}/nixos.qcow2"
+              echo ">>> New image — copying read-only base from the nix store"
+              echo "    source: $SOURCE"
               echo "    target: $DISK"
-              cp --reflink=auto "${demoVm}/nixos.qcow2" "$DISK"
+              cp --reflink=auto "$SOURCE" "$DISK"
               chmod u+w "$DISK"
+              # Show older demo disks the user might want to reclaim space from.
+              OLDER=$(ls -1 "$STATE_DIR"/demo-*.qcow2 2>/dev/null | grep -vF "$DISK" || true)
+              if [ -n "$OLDER" ]; then
+                echo ">>> Older demo disks present (delete to reclaim space):"
+                echo "$OLDER" | sed 's/^/    /'
+              fi
             else
-              echo ">>> Reusing existing disk at $DISK"
-              echo "    (delete it to start over)"
+              echo ">>> Reusing existing writable disk:"
+              echo "    $DISK"
+              echo "    (delete it to start over from the base image)"
             fi
 
             ACCEL_ARGS=()

@@ -44,7 +44,11 @@ in
   # ── Graphical session, auto-login ──────────────────────────────────
   services.xserver = {
     enable = true;
-    desktopManager.xfce.enable = true;
+    desktopManager.xfce = {
+      enable = true;
+      # Demo VM: no need to lock the screen on idle.
+      enableScreensaver = false;
+    };
     displayManager.lightdm.enable = true;
   };
   services.displayManager.autoLogin = {

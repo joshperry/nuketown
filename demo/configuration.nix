@@ -93,20 +93,31 @@ in
       '';
 
       packages = with pkgs; [
-        # Keep the demo image small: skip claude-code by default.
-        # The portal opens a plain shell so the sudo→zenity story is
-        # visible without needing API keys.
+        unstable.claude-code
       ];
 
       persist = [ "projects" ];
       sudo.enable = true;
-      portal = {
-        enable = true;
-        # Override the default (claude-code) so the demo works offline.
-        command = "${pkgs.bashInteractive}/bin/bash -l";
-      };
+      portal.enable = true;  # default command = claude-code
     };
   };
+
+  # portal-ada uses `tmux new-window`, which requires an existing tmux
+  # session. Auto-attach interactive terminals to a shared session named
+  # "portal" so `portal-ada` just works from a fresh xfce4-terminal.
+  # SSH sessions are left alone so remote shells aren't hijacked.
+  programs.bash.interactiveShellInit = ''
+    if [ -z "$TMUX" ] && [ -z "$SSH_CONNECTION" ] && [ -t 1 ] && [ "$TERM" != "dumb" ]; then
+      exec ${pkgs.tmux}/bin/tmux new-session -A -s portal
+    fi
+  '';
+
+  # portal-ada's fzf picker searches ~/dev. Seed a placeholder project
+  # so the picker has something to show on first run.
+  systemd.tmpfiles.rules = [
+    "d /home/${humanName}/dev 0755 ${humanName} users -"
+    "d /home/${humanName}/dev/welcome 0755 ${humanName} users -"
+  ];
 
   # ── Human's home-manager: approval daemon + welcome ────────────────
   home-manager.useGlobalPkgs = true;
@@ -122,29 +133,39 @@ in
       Welcome to the Nuketown demo.
 
       You are logged in as "${humanName}" (password: ${humanPassword}).
-      Open a terminal and try:
+      Open Terminal Emulator from the XFCE menu — it lands you in a
+      tmux session named "portal". Try:
 
         portal-ada
-            Opens a tmux split — your shell on one side, agent "ada"
-            on the other, both in the same project directory.
+            Picks a project via fzf (~/dev/welcome is pre-seeded).
+            Opens a tmux split: your shell on the left, agent "ada"
+            running claude-code on the right, both cd'd into the
+            project's directory in ada's home (/agents/ada/projects/).
 
         sudo machinectl shell ada@
-            Drop into ada's session directly.
+            Drop directly into ada's machinectl session.
 
-        From ada's shell, run:
+        From ada's shell, try:
             sudo whoami
-            A zenity dialog should pop up on YOUR desktop asking to
-            approve the sudo request. Approve it. ada gets root.
-            Deny it. ada gets nothing.
+            A zenity dialog pops up on YOUR desktop asking to approve
+            the sudo request. Approve → ada gets root. Deny → ada gets
+            nothing. The agent NEVER has a password.
 
-        git log --author=ada
-            ada has her own git identity. Anything she commits is
-            signed by her, not you.
+        git config --global user.email
+            Returns ada@nuketown.demo — she has her own git identity.
+            Commits she makes are signed by her, not by you.
 
-      The agent's home (/agents/ada) is wiped on every reboot. Only
-      /agents/ada/projects survives (impermanence). Try it: leave a
-      file in /agents/ada/foo and another in /agents/ada/projects/foo,
-      then reboot.
+      Notes:
+        - claude-code is launched with --dangerously-skip-permissions so
+          ada can edit files freely inside her own home. You'll see a
+          login screen the first time; you can press Ctrl-C out of it
+          and explore the shell instead if you don't have an Anthropic
+          account handy.
+        - The agent's home (/agents/ada) is wiped on every reboot in
+          the real nuketown setup. In this demo image there's no btrfs
+          rollback configured, so /agents/ada persists across reboots
+          — but the persist={"projects"} attribute on the agent shows
+          the layout the real system uses.
     '';
   };
 

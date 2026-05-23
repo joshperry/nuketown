@@ -72,28 +72,35 @@ qemu-system-x86_64 -enable-kvm -m 4096 -smp 2 \
 
 ## The 60-second tour
 
-Once the desktop loads, open `xfce4-terminal` and:
+Once the desktop loads, open Terminal Emulator. The shell auto-attaches
+to a tmux session named `portal` (so `portal-ada` works — it needs to
+be inside tmux to split a new window). Try:
 
 ```bash
-# Pop into a tmux split with ada on one side, you on the other.
+# Pick a project (~/dev/welcome is pre-seeded), then open a split:
+# your shell on the left, ada running claude-code on the right.
 portal-ada
 
-# In the ada pane, ask for sudo. A zenity dialog appears on YOUR
+# Or drop straight into ada's session:
+sudo machinectl shell ada@
+
+# From ada's shell, ask for sudo. A zenity dialog pops up on YOUR
 # desktop asking whether to approve. Approve → ada gets root.
 sudo whoami
-
-# Or drop directly into ada's session:
-sudo machinectl shell ada@
 
 # ada has her own git identity:
 git config --global user.email   # → ada@nuketown.demo
 ```
 
-Reboot the VM and notice that `/agents/ada` is gone except for
-`/agents/ada/projects` (the `persist` entry from her agent config).
-The ephemeral-home story is conceptual in the demo image — there's no
-separate btrfs subvolume to roll back to — but the persistence layout
-matches the real `signi` setup.
+claude-code launches with `--dangerously-skip-permissions` so ada can
+edit freely inside `/agents/ada`. First run shows a login prompt; Ctrl-C
+out if you don't have an Anthropic account handy and use the shell
+instead.
+
+The ephemeral-home story (btrfs rollback of `/agents/<name>` on every
+boot) is conceptual in this demo image — there's no separate btrfs
+subvolume — but the `persist={"projects"}` layout on the agent matches
+the real `signi` setup.
 
 ## Layout
 

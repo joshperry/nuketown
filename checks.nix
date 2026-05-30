@@ -105,7 +105,10 @@ let
         role = "software";
         description = "Test software agent";
         packages = with pkgs; [ unstable.claude-code ];
-        persist = [ "projects" ".config/claude" ];
+        persist = {
+          directories = [ "projects" ".config/claude" ];
+          files = [ ".bash_history" ];
+        };
         sudo.enable = true;
         portal.enable = true;
         devices = [
@@ -136,7 +139,7 @@ let
         role = "research";
         description = "Research agent";
         packages = with pkgs; [ unstable.claude-code ];
-        persist = [ "projects" "notes" ];
+        persist.directories = [ "projects" "notes" ];
         sudo.enable = true;
       };
     };
@@ -299,9 +302,12 @@ in {
   module-persistence = mkCheck "module-persistence" (let
     adaPersist = fullCfg.environment.persistence."/persist".users.ada.directories;
     dirNames = map (d: d.directory) adaPersist;
+    adaFiles = fullCfg.environment.persistence."/persist".users.ada.files;
+    fileNames = map (f: f.file) adaFiles;
   in [
     (assertEq "persist projects" (builtins.elem "projects" dirNames) true)
     (assertEq "persist claude config" (builtins.elem ".config/claude" dirNames) true)
+    (assertEq "persist bash history file" (builtins.elem ".bash_history" fileNames) true)
   ]);
 
   module-tmpfiles = mkCheck "module-tmpfiles" (let

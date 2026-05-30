@@ -100,7 +100,7 @@ in
         unstable.claude-code
       ];
 
-      persist = [ "projects" ];
+      persist.directories = [ "projects" ];
       sudo.enable = true;
       portal.enable = true;  # default command = claude-code
     };

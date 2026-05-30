@@ -267,9 +267,22 @@ let
       };
 
       persist = lib.mkOption {
-        type = lib.types.listOf lib.types.str;
-        default = [ "projects" ];
-        description = "Directories under the agent's home to persist across reboots";
+        type = lib.types.submodule {
+          options = {
+            directories = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ "projects" ];
+              description = "Directories under the agent's home to persist across reboots";
+            };
+            files = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [];
+              description = "Individual files under the agent's home to persist across reboots";
+            };
+          };
+        };
+        default = {};
+        description = "Home paths to persist across reboots (mirrors impermanence's directories/files)";
       };
 
       secrets = {
@@ -580,7 +593,7 @@ let
   # populates identity.toml.
 
   mkAgentPrompt = id: agent: let
-    persistList = lib.concatMapStringsSep ", " (d: "`${d}`") id.persist;
+    persistList = lib.concatMapStringsSep ", " (d: "`${d}`") id.persist.directories;
 
     sudoSection = lib.optionalString id.sudo ''
 
@@ -1104,7 +1117,8 @@ in
     # ── Impermanence ─────────────────────────────────────────────
     environment.persistence."/persist" = {
       users = lib.mapAttrs (name: agent: {
-        directories = agent.persist;
+        directories = agent.persist.directories;
+        files = agent.persist.files;
       }) enabledAgents;
     };
 

@@ -29,10 +29,15 @@
         dfu-util
       ];
 
-      persist = [
-        "projects"
-        ".config/claude"
-      ];
+      persist = {
+        directories = [
+          "projects"
+          ".config/claude"
+        ];
+        files = [
+          ".bash_history"
+        ];
+      };
 
       secrets.sshKey = "ada/ssh-key";
       secrets.gpgKey = "ada/gpg-key";
@@ -106,7 +111,7 @@
         python3
       ];
 
-      persist = [
+      persist.directories = [
         "projects"
         "notes"
       ];

@@ -217,7 +217,7 @@
                   unstable.claude-code
                 ];
 
-                persist = [ "projects" ];
+                persist.directories = [ "projects" ];
 
                 sudo.enable = true;
                 portal.enable = true;
@@ -257,7 +257,7 @@
                 role = "software";
                 description = "Software development agent";
                 packages = with pkgs; [ unstable.claude-code gcc ];
-                persist = [ "projects" ];
+                persist.directories = [ "projects" ];
                 sudo.enable = true;
                 portal.enable = true;
               };
@@ -268,7 +268,7 @@
                 role = "research";
                 description = "Research and documentation agent";
                 packages = with pkgs; [ unstable.claude-code python3 ];
-                persist = [ "projects" "notes" ];
+                persist.directories = [ "projects" "notes" ];
                 portal.enable = true;
               };
 
@@ -278,7 +278,7 @@
                 role = "operations";
                 description = "System operations agent";
                 packages = with pkgs; [ unstable.claude-code kubectl ];
-                persist = [ "projects" ];
+                persist.directories = [ "projects" ];
                 sudo.enable = true;
               };
             };
@@ -311,7 +311,7 @@
                 role = "software";
                 description = "Daemon test agent";
 
-                persist = [ "projects" ];
+                persist.directories = [ "projects" ];
                 sudo.enable = true;
                 portal.enable = true;
 
@@ -384,7 +384,7 @@
                   openocd
                 ];
 
-                persist = [ "projects" ];
+                persist.directories = [ "projects" ];
                 sudo.enable = true;
                 portal.enable = true;
 

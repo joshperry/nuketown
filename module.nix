@@ -281,18 +281,6 @@ let
         description = "Home paths to persist across reboots (mirrors impermanence's directories/files)";
       };
 
-      knownHosts = lib.mkOption {
-        type = lib.types.listOf lib.types.str;
-        default = [];
-        description = ''
-          known_hosts lines to pin at the agent's ~/.ssh/known_hosts. Needed
-          so SSH git operations succeed in non-interactive sessions, where
-          there is no TTY to accept an unknown host key. Each entry is a full
-          known_hosts line; the file is a read-only symlink into the store.
-        '';
-        example = [ "github.com ssh-ed25519 AAAAC3Nza..." ];
-      };
-
       secrets = {
         sshKey = lib.mkOption {
           type = lib.types.nullOr lib.types.str;
@@ -545,7 +533,7 @@ let
   };
 
   enabledAgents = lib.filterAttrs (_: a: a.enable) cfg.agents;
-  knownHostsAgents = lib.filterAttrs (_: a: a.enable && a.knownHosts != []) cfg.agents;
+  sshKeyAgents = lib.filterAttrs (_: a: a.enable && a.secrets.sshKey != null) cfg.agents;
   sudoAgents = lib.filterAttrs (_: a: a.enable && a.sudo.enable) cfg.agents;
   claudeCodeAgents = lib.filterAttrs (_: a: a.enable && a.claudeCode.enable) cfg.agents;
   daemonAgents = lib.filterAttrs (_: a: a.enable && a.daemon.enable) cfg.agents;
@@ -1187,17 +1175,14 @@ in
         "d /run/nuketown-broker 2750 ${cfg.humanUser} nuketown-broker -"
         "d /run/sops-age 0773 root nuketown-secrets -"
       ]
-      # Pin each agent's known_hosts as a read-only symlink into the store.
-      # The .ssh dir is created root-owned by the sops sshKey secret; match
-      # that ownership so the two mechanisms don't fight over the directory.
-      ++ lib.concatLists (lib.mapAttrsToList (name: agent:
-        let
-          khFile = pkgs.writeText "${name}-known_hosts"
-            (lib.concatStringsSep "\n" agent.knownHosts + "\n");
-        in [
-          "d ${cfg.agentsDir}/${name}/.ssh 0755 root root -"
-          "L+ ${cfg.agentsDir}/${name}/.ssh/known_hosts - - - - ${khFile}"
-        ]) knownHostsAgents);
+      # Pre-create ~/.ssh agent-owned, early in sysinit. The sops sshKey secret
+      # symlinks the key into ~/.ssh and would otherwise MkdirAll the parent as
+      # root, locking the agent (and its home-manager activation) out of its own
+      # ~/.ssh. Creating it first means sops' MkdirAll no-ops on an agent-owned
+      # dir, so SSH config/known_hosts from home-manager land correctly.
+      ++ lib.mapAttrsToList (name: _:
+        "d ${cfg.agentsDir}/${name}/.ssh 0700 ${name} ${name} -"
+      ) sshKeyAgents;
 
     # The approval daemon runs as a user service under the human's
     # session so it has access to the X11/Wayland display for zenity.

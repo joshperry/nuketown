@@ -859,15 +859,55 @@ in
             # bash -l loads the agent's full home-manager profile via PAM.
             agentLauncher = pkgs.writeShellScript "portal-launcher-${name}" ''
               path="$1"
-              shift
-              session=$(basename "$path")
-              exec /run/current-system/sw/bin/machinectl shell ${name}@ ${pkgs.bash}/bin/bash -l -c "mkdir -p '$path' && cd '$path' && TMUX= exec ${pkgs.tmux}/bin/tmux -L portal-${name} new-session -As '$session' \\; set -g status off \\; send-keys '${agent.portal.command} $*' C-m"
+              session="$2"
+              exec /run/current-system/sw/bin/machinectl shell ${name}@ ${pkgs.bash}/bin/bash -l -c "mkdir -p '$path' && cd '$path' && TMUX= exec ${pkgs.tmux}/bin/tmux -L portal-${name} new-session -As '$session' \\; set -g status off \\; send-keys '${agent.portal.command}' C-m"
+            '';
+
+            # List the agent's live tmux sessions (names only). Runs via
+            # machinectl so it sees the agent user's own tmux server; the
+            # caller greps for real session names, so machinectl's banner
+            # (if any) is harmless. Empty output = no server / no sessions.
+            listSessions = pkgs.writeShellScript "portal-sessions-${name}" ''
+              /run/current-system/sw/bin/machinectl shell ${name}@ ${pkgs.bash}/bin/bash -l -c "${pkgs.tmux}/bin/tmux -L portal-${name} list-sessions -F '#{session_name}' 2>/dev/null" 2>/dev/null | tr -d '\r'
             '';
           in
           pkgs.writeShellScriptBin "portal-${name}" ''
             # Portal into ${name}'s workspace
             # Usage: portal-${name} [path]
             #   path: optional project directory (fzf picker if omitted)
+            #
+            # With no live session for a project, a fresh one is opened
+            # directly. When sessions already exist, an fzf list offers them
+            # plus a "+ New problem" entry that spawns an independent session
+            # (project, project-2, ... or project-<id> if you name it), so you
+            # can run several agents on the same project side by side.
+
+            tmux=${pkgs.tmux}/bin/tmux
+
+            # Open an outer window (your shell + the agent) for a session.
+            launch_session() {
+              local session="$1"
+              "$tmux" new-window -c "$path" -n "$session"
+              "$tmux" split-window -h -l ${splitPercent}% -c "$path"
+              "$tmux" send-keys "${agentLauncher} \"$agent_path\" \"$session\"" C-m
+              "$tmux" select-pane -L
+            }
+
+            # Name a new session: <proj>-<id> if an id is given, else the bare
+            # project name when free, else the lowest free <proj>-N.
+            pick_new_session() {
+              local id
+              id=$(printf '%s' "$1" | tr ' /' '--' | tr -cd 'A-Za-z0-9._-')
+              if [ -n "$id" ]; then printf '%s\n' "$wname-$id"; return; fi
+              if ! printf '%s\n' "''${sessions[@]}" | grep -qx "$wname"; then
+                printf '%s\n' "$wname"; return
+              fi
+              local n=2
+              while printf '%s\n' "''${sessions[@]}" | grep -qx "$wname-$n"; do
+                n=$((n + 1))
+              done
+              printf '%s\n' "$wname-$n"
+            }
 
             path=$1
             if [ "$#" -eq 0 ]; then
@@ -897,10 +937,33 @@ in
             wname=$(basename "$path")
             agent_path="${cfg.agentsDir}/${name}/projects/$wname"
 
-            ${pkgs.tmux}/bin/tmux new-window -c "$path" -n "$wname"
-            ${pkgs.tmux}/bin/tmux split-window -h -l ${splitPercent}% -c "$path"
-            ${pkgs.tmux}/bin/tmux send-keys "${agentLauncher} \"$agent_path\"" C-m
-            ${pkgs.tmux}/bin/tmux select-pane -L
+            # Existing agent sessions for this project (project, project-2,
+            # project-<id>, ...), newest naming sorted naturally.
+            mapfile -t sessions < <(${listSessions} | grep -E "^$wname(-.+)?$" | sort -V)
+
+            # First session for this project: open it directly, no picker.
+            if [ ''${#sessions[@]} -eq 0 ]; then
+              launch_session "$wname"
+              exit 0
+            fi
+
+            # Otherwise pick an existing problem or start a new one.
+            choice=$({ printf '%s\n' "''${sessions[@]}"; echo "+ New problem"; } | \
+              ${pkgs.fzf}/bin/fzf --prompt="${name}/$wname> ")
+            [[ -z "$choice" ]] && exit 1
+
+            if [ "$choice" = "+ New problem" ]; then
+              read -r -p "short id (optional): " id
+              launch_session "$(pick_new_session "$id")"
+              exit 0
+            fi
+
+            # Existing session chosen: jump to its window if it is already
+            # open, otherwise re-open a pane attached to it.
+            if "$tmux" list-windows -F '#{window_name}' 2>/dev/null | grep -qx "$choice"; then
+              exec "$tmux" select-window -t "$choice"
+            fi
+            launch_session "$choice"
           ''
         )
       ) enabledAgents)

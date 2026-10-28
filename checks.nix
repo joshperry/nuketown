@@ -361,8 +361,11 @@ in {
     (assertEq "sudoex-run in sudoers" hasSudoexRun true)
     (assertEq "sudoex-run is NOPASSWD"
       (builtins.elem "NOPASSWD" sudoexRunCmd.options) true)
-    (assertEq "sudoex-run is SETENV"
-      (builtins.elem "SETENV" sudoexRunCmd.options) true)
+    # SETENV would let the agent set BASH_ENV etc. for a root shell script
+    (assertEq "sudoex-run is not SETENV"
+      (builtins.elem "SETENV" sudoexRunCmd.options) false)
+    (assertEq "no agent sudo rule is SETENV"
+      (builtins.any (c: builtins.elem "SETENV" c.options) commands) false)
   ]);
 
   # ── Agent Packages (broker scripts) ───────────────────────────

@@ -10,55 +10,77 @@ let
 
   socketPath = "/run/nuketown-broker/socket";
 
+  # Shared by the root-side wrappers (sudo-with-approval, sudoex-run).
+  # These run as root via sudo, so the requesting user comes from sudo's
+  # SUDO_USER and the broker is asked from root: on the path that grants
+  # root, the agent never talks to the broker itself. argv is rendered
+  # with %q so the dialog shows exactly what will run, on one line (a
+  # newline in an argument can't start a second request line).
+  #
+  # approval_request <requirements> <display-cmd>: returns 0 if approved.
+  approvalRequestFn = ''
+    approval_request() {
+      local requirements="$1" display="$2" mock_mode response
+      local socket_path="${socketPath}"
+      local mock_file="/run/nuketown-broker/mode"
+      local requesting_user="''${SUDO_USER:-$(${pkgs.coreutils}/bin/id -un)}"
+
+      # Check for mock approval mode (for testing)
+      if [ -f "$mock_file" ]; then
+        mock_mode=$(${pkgs.coreutils}/bin/tr -d '\n\r ' < "$mock_file")
+        if [ "$mock_mode" = "MOCK_APPROVED" ]; then
+          echo "[MOCK] Auto-approved: $display" >&2
+          return 0
+        elif [ "$mock_mode" = "MOCK_DENIED" ]; then
+          echo "[MOCK] Auto-denied: $display" >&2
+          return 1
+        else
+          echo "Error: Invalid mock mode in $mock_file (got: '$mock_mode')" >&2
+          echo "Expected: MOCK_APPROVED or MOCK_DENIED" >&2
+          return 1
+        fi
+      fi
+
+      if [ ! -S "$socket_path" ]; then
+        echo "Error: Approval daemon is not running (socket not found at $socket_path)" >&2
+        return 1
+      fi
+
+      response=$(printf "%sSUDO:%s:%s\n\n" "$requirements" "$requesting_user" "$display" | \
+        ${pkgs.socat}/bin/socat STDIO,ignoreeof UNIX-CONNECT:"$socket_path" || echo "ERROR")
+
+      if [ "$response" = "APPROVED" ]; then
+        return 0
+      elif [ "$response" = "DENIED" ]; then
+        echo "Request denied." >&2
+        return 1
+      else
+        echo "Error communicating with approval daemon (got: '$response')" >&2
+        return 1
+      fi
+    }
+
+    # Render argv as one shell-quoted line.
+    quote_argv() {
+      local out
+      printf -v out '%q ' "$@"
+      printf '%s' "''${out% }"
+    }
+  '';
+
   approvalWrapper = pkgs.writeShellScriptBin "sudo-with-approval" ''
     set -e
+    ${approvalRequestFn}
 
-    SOCKET_PATH="${socketPath}"
-    MOCK_FILE="/run/nuketown-broker/mode"
-    REQUESTING_USER="''${SUDO_USER:-$(whoami)}"
-    COMMAND="$*"
-
-    if [ -z "$COMMAND" ]; then
+    if [ $# -eq 0 ]; then
       echo "Usage: sudo sudo-with-approval <command>" >&2
       exit 1
     fi
 
-    # Check for mock approval mode (for testing)
-    if [ -f "$MOCK_FILE" ]; then
-      MOCK_MODE=$(${pkgs.coreutils}/bin/cat "$MOCK_FILE" | ${pkgs.coreutils}/bin/tr -d '\n\r ')
-
-      if [ "$MOCK_MODE" = "MOCK_APPROVED" ]; then
-        echo "[MOCK] Auto-approved: $COMMAND" >&2
-        exec ${pkgs.sudo}/bin/sudo "$@"
-      elif [ "$MOCK_MODE" = "MOCK_DENIED" ]; then
-        echo "[MOCK] Auto-denied: $COMMAND" >&2
-        exit 1
-      else
-        echo "Error: Invalid mock mode in $MOCK_FILE (got: '$MOCK_MODE')" >&2
-        echo "Expected: MOCK_APPROVED or MOCK_DENIED" >&2
-        exit 1
-      fi
-    fi
-
-    # Normal approval flow via socket
-    if [ ! -S "$SOCKET_PATH" ]; then
-      echo "Error: Approval daemon is not running (socket not found at $SOCKET_PATH)" >&2
-      exit 1
-    fi
-
-    # Send request to daemon and wait for response
-    # Username:command format — usernames can't contain colons on Unix
-    RESPONSE=$(printf "%s\n\n" "$REQUESTING_USER:$COMMAND" | ${pkgs.socat}/bin/socat STDIO,ignoreeof UNIX-CONNECT:"$SOCKET_PATH" || echo "ERROR")
-
-    if [ "$RESPONSE" = "APPROVED" ]; then
+    if approval_request "" "$(quote_argv "$@")"; then
       exec ${pkgs.sudo}/bin/sudo "$@"
-    elif [ "$RESPONSE" = "DENIED" ]; then
-      echo "Request denied." >&2
-      exit 1
-    else
-      echo "Error communicating with approval daemon (got: '$RESPONSE')" >&2
-      exit 1
     fi
+    exit 1
   '';
 
   # ── Sops Helpers ───────────────────────────────────────────────
@@ -96,19 +118,32 @@ let
   '';
 
   # sudoex: extended sudo with composable requirements
-  # Sends all requirements + SUDO to broker on one connection.
+  # Agent-side front end; the root-side sudoex-run asks the broker.
   # Usage: sudoex [--decrypt src:dest] [--] <command...>
   sudoex = pkgs.writeShellScriptBin "sudoex" ''
+    if [ $# -eq 0 ]; then
+      echo "Usage: sudoex [--decrypt src:dest] [--] <command...>" >&2
+      exit 1
+    fi
+
+    exec /run/wrappers/bin/sudo /run/current-system/sw/bin/sudoex-run "$@"
+  '';
+
+  # sudoex-run: root-side target of sudoex. Sends all requirements + SUDO
+  # to the broker on one connection (one popup), then execs on approval.
+  sudoexRun = pkgs.writeShellScriptBin "sudoex-run" ''
     set -e
+    ${approvalRequestFn}
 
-    SOCKET_PATH="${socketPath}"
-    REQUESTING_USER="$(whoami)"
     REQUIREMENTS=""
-
-    # Parse flags into requirements
     while [[ $# -gt 0 ]]; do
       case $1 in
         --decrypt)
+          # The broker protocol is line- and colon-delimited.
+          if [[ "''${2-}" != *:* || "$2" == *$'\n'* || "$2" == *$'\r'* ]]; then
+            echo "Error: --decrypt takes src:dest" >&2
+            exit 1
+          fi
           REQUIREMENTS="''${REQUIREMENTS}DECRYPT:$2"$'\n'
           shift 2
           ;;
@@ -122,38 +157,15 @@ let
       esac
     done
 
-    COMMAND="$*"
-
-    if [ -z "$COMMAND" ]; then
+    if [ $# -eq 0 ]; then
       echo "Usage: sudoex [--decrypt src:dest] [--] <command...>" >&2
       exit 1
     fi
 
-    if [ ! -S "$SOCKET_PATH" ]; then
-      echo "Error: Broker daemon is not running (socket not found at $SOCKET_PATH)" >&2
-      exit 1
+    if approval_request "$REQUIREMENTS" "$(quote_argv "$@")"; then
+      exec "$@"
     fi
-
-    # Send all requirements + SUDO on one connection
-    RESPONSE=$(printf "%sSUDO:%s:%s\n\n" "$REQUIREMENTS" "$REQUESTING_USER" "$COMMAND" | \
-      ${pkgs.socat}/bin/socat STDIO,ignoreeof UNIX-CONNECT:"$SOCKET_PATH" || echo "ERROR")
-
-    if [ "$RESPONSE" = "APPROVED" ]; then
-      /run/wrappers/bin/sudo /run/current-system/sw/bin/sudoex-run "$@"
-      RC=$?
-      exit $RC
-    elif [ "$RESPONSE" = "DENIED" ]; then
-      echo "Denied." >&2
-      exit 1
-    else
-      echo "Error communicating with broker (got: '$RESPONSE')" >&2
-      exit 1
-    fi
-  '';
-
-  # sudoex-run: privilege escalation target for sudoex. Just execs its args.
-  sudoexRun = pkgs.writeShellScriptBin "sudoex-run" ''
-    exec "$@"
+    exit 1
   '';
 
   # nuketown-switch: convenience wrapper for switch-with-secrets
@@ -1199,16 +1211,16 @@ in
             then [
               {
                 command = "/run/current-system/sw/bin/sudo-with-approval";
-                options = [ "NOPASSWD" "SETENV" ];
+                options = [ "NOPASSWD" ];
               }
               {
                 command = "/run/current-system/sw/bin/sudoex-run";
-                options = [ "NOPASSWD" "SETENV" ];
+                options = [ "NOPASSWD" ];
               }
             ]
             else map (cmd: {
               command = cmd;
-              options = [ "NOPASSWD" "SETENV" ];
+              options = [ "NOPASSWD" ];
             }) agent.sudo.commands;
         }
       ) enabledAgents)

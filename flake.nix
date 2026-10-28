@@ -547,6 +547,13 @@
           inherit nixpkgs nixpkgs-unstable home-manager impermanence sops-nix;
           nuketownModule = ./module.nix;
         }
+        // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          vm-sudo-approval-bypass = import ./tests/sudo-approval-bypass.nix {
+            pkgs = pkgsFor system;
+            inherit nixpkgs-unstable home-manager impermanence sops-nix;
+            nuketownModule = ./module.nix;
+          };
+        }
       );
 
       # Package outputs

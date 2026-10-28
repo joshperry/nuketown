@@ -8,7 +8,7 @@ let
 
   escapeHtml = ''
     escape_html() {
-      echo "$1" | ${pkgs.gnused}/bin/sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
+      printf "%s\n" "$1" | ${pkgs.gnused}/bin/sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
     }
   '';
 

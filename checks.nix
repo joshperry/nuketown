@@ -278,17 +278,20 @@ in {
 
   module-sudo = mkCheck "module-sudo" (let
     rules = fullCfg.security.sudo.extraRules;
-    adaRule = builtins.head (builtins.filter (r: builtins.elem "ada" r.users) rules);
+    adaRules = builtins.filter (r: builtins.elem "ada" r.users) rules;
+    adaRule = builtins.head adaRules;
   in [
     # sudo shim is in packages (it's a derivation, just check the list is non-empty
     # and PATH override is set)
     (assertContains "PATH override for sudo shim"
       adaHM.programs.bash.sessionVariables.PATH
       "/etc/profiles/per-user/ada/bin")
-    (assertEq "sudo rule user" adaRule.users [ "ada" ])
-    (assertContains "sudo rule command"
-      (builtins.head adaRule.commands).command
-      "sudo-with-approval")
+    # The agent's only rule: start nuketown-approve as the service user.
+    (assertEq "one sudo rule for ada" (builtins.length adaRules) 1)
+    (assertEq "ada runs as nuketown-approval" adaRule.runAs "nuketown-approval")
+    (assertEq "ada rule command"
+      (map (c: c.command) adaRule.commands)
+      [ "/run/current-system/sw/bin/nuketown-approve" ])
   ]);
 
   module-udev = mkCheck "module-udev" (let
@@ -333,8 +336,11 @@ in {
       (builtins.hasAttr "nuketown-broker" fullCfg.users.groups) true)
     (assertEq "nuketown-secrets group exists"
       (builtins.hasAttr "nuketown-secrets" fullCfg.users.groups) true)
-    (assertEq "ada in nuketown-broker group"
-      (builtins.elem "nuketown-broker" fullCfg.users.users.ada.extraGroups) true)
+    # Only the service user talks to the broker, never the agents.
+    (assertEq "ada not in nuketown-broker group"
+      (builtins.elem "nuketown-broker" fullCfg.users.users.ada.extraGroups) false)
+    (assertEq "nuketown-approval in nuketown-broker group"
+      (builtins.elem "nuketown-broker" fullCfg.users.users.nuketown-approval.extraGroups) true)
     (assertEq "human in nuketown-secrets group"
       (builtins.elem "nuketown-secrets" fullCfg.users.users.human.extraGroups) true)
   ];
@@ -347,25 +353,43 @@ in {
       (builtins.hasAttr "nuketown-secrets" customCfg.users.groups) false)
   ];
 
-  # ── Sudoex-run in Sudoers ─────────────────────────────────────
+  # ── Approval service user ──────────────────────────────────
 
-  module-sudoex-run = mkCheck "module-sudoex-run" (let
+  module-approval-sudoers = mkCheck "module-approval-sudoers" (let
     rules = fullCfg.security.sudo.extraRules;
-    adaRule = builtins.head (builtins.filter (r: builtins.elem "ada" r.users) rules);
-    commands = adaRule.commands;
-    hasApprovalWrapper = builtins.any (c: nixpkgs.lib.hasInfix "sudo-with-approval" c.command) commands;
-    hasSudoexRun = builtins.any (c: nixpkgs.lib.hasInfix "sudoex-run" c.command) commands;
-    sudoexRunCmd = builtins.head (builtins.filter (c: nixpkgs.lib.hasInfix "sudoex-run" c.command) commands);
+    agentRules = builtins.filter (r: builtins.elem "ada" r.users) rules;
+    svcRules = builtins.filter (r: builtins.elem "nuketown-approval" r.users) rules;
+    allCmds = builtins.concatMap (r: r.commands) rules;
   in [
-    (assertEq "sudo-with-approval in sudoers" hasApprovalWrapper true)
-    (assertEq "sudoex-run in sudoers" hasSudoexRun true)
-    (assertEq "sudoex-run is NOPASSWD"
-      (builtins.elem "NOPASSWD" sudoexRunCmd.options) true)
-    # SETENV would let the agent set BASH_ENV etc. for a root shell script
-    (assertEq "sudoex-run is not SETENV"
-      (builtins.elem "SETENV" sudoexRunCmd.options) false)
-    (assertEq "no agent sudo rule is SETENV"
-      (builtins.any (c: builtins.elem "SETENV" c.options) commands) false)
+    (assertEq "no agent rule runs as root"
+      (builtins.any (r: r.runAs != "nuketown-approval") agentRules) false)
+    (assertEq "no agent rule names the old root wrappers"
+      (builtins.any (c: nixpkgs.lib.hasInfix "sudo-with-approval" c.command
+                     || nixpkgs.lib.hasInfix "sudoex-run" c.command) allCmds) false)
+    # SETENV would let a caller set BASH_ENV etc. for a shell script
+    (assertEq "no agent or service-user rule is SETENV"
+      (builtins.any (c: builtins.elem "SETENV" c.options)
+        (builtins.concatMap (r: r.commands) (agentRules ++ svcRules))) false)
+    (assertEq "service user has one rule" (builtins.length svcRules) 1)
+    (assertEq "service user is a system user"
+      fullCfg.users.users.nuketown-approval.isSystemUser true)
+    (assertEq "human can read requests"
+      (builtins.elem "human" fullCfg.users.groups.nuketown-approval-read.members) true)
+    (assertEq "audit dir persisted"
+      (builtins.any (d: d.directory == "/var/lib/nuketown-approval")
+        fullCfg.environment.persistence."/persist".directories) true)
+  ]);
+
+  module-approval-reviewer = mkCheck "module-approval-reviewer" (let
+    cfg = evalConfig fullAgentConfig [{
+      nuketown.agents.reviewer = { enable = true; uid = 1101; };
+      nuketown.approval.reviewer.enable = true;
+    }];
+  in [
+    (assertEq "reviewer can read requests"
+      (builtins.elem "reviewer" cfg.users.groups.nuketown-approval-read.members) true)
+    (assertEq "reviewer has no sudo"
+      (builtins.any (r: builtins.elem "reviewer" r.users) cfg.security.sudo.extraRules) false)
   ]);
 
   # ── Agent Packages (broker scripts) ───────────────────────────
@@ -392,15 +416,15 @@ in {
     (assertEq "bot lacks sudo shim" (builtins.elem "sudo" pkgNames) false)
   ]);
 
-  # ── System Packages (approval wrapper + sudoex-run) ────────────
+  # ── System Packages ────────────────────────────────────────────
 
   module-system-packages = mkCheck "module-system-packages" (let
     sysPkgNames = map (p: p.name) fullCfg.environment.systemPackages;
   in [
-    (assertEq "sudo-with-approval in system packages"
-      (builtins.elem "sudo-with-approval" sysPkgNames) true)
-    (assertEq "sudoex-run in system packages"
-      (builtins.elem "sudoex-run" sysPkgNames) true)
+    (assertEq "nuketown-approve in system packages"
+      (builtins.elem "nuketown-approve" sysPkgNames) true)
+    (assertEq "sudo-with-approval gone"
+      (builtins.elem "sudo-with-approval" sysPkgNames) false)
   ]);
 
   # ── Claude Code Integration Checks ─────────────────────────────
@@ -627,6 +651,32 @@ in {
   in [
     (assertEq "no xmpp broker service when disabled"
       (builtins.hasAttr "nuketown-broker-xmpp" humanHM.systemd.user.services) false)
+  ]);
+
+  # ── signi compatibility ────────────────────────────────────────
+  # Mirrors the nuketown options mynix sets for signi (sudo + portal agent,
+  # btrfs device, broker in the human's home-manager) and forces the whole
+  # system to evaluate, so an option change that breaks signi fails here.
+
+  signi-compat = mkCheck "signi-compat" (let
+    cfg = evalConfig fullAgentConfig [
+      ({ ... }: {
+        nuketown.domain = nixpkgs.lib.mkForce "6bit.com";
+        nuketown.btrfsDevice = "38b243a0-c875-4758-8998-cc6c6a4c451e";
+        home-manager.users.human = {
+          imports = [ ./approval-daemon.nix ];
+          nuketown.approvalDaemon.enable = true;
+        };
+      })
+    ];
+    humanHM = cfg.home-manager.users.human;
+  in [
+    (assertEq "toplevel evaluates"
+      (builtins.isString cfg.system.build.toplevel.drvPath) true)
+    (assertEq "broker service present"
+      (builtins.hasAttr "nuketown-broker" humanHM.systemd.user.services) true)
+    (assertEq "reviewer off by default" cfg.nuketown.approval.reviewer.enable false)
+    (assertEq "zenity prompter by default" humanHM.nuketown.approvalDaemon.prompter null)
   ]);
 
 }

@@ -3,110 +3,22 @@
 let
   cfg = config.nuketown;
 
-  # ── Sudo Approval Wrapper ───────────────────────────────────────
-  # The approval wrapper connects to the approval daemon's socket,
-  # sends the request, and execs the command on approval.
-  # The daemon itself runs as a user service (see approval-daemon.nix).
+  # ── Sudo Approval ───────────────────────────────────────────────
+  # Agents have no sudo rule that reaches root. The `sudo` shim, `sudoex`
+  # and `sops-unlock` all run nuketown-approve as the nuketown-approval
+  # service user (see approval.nix), which asks the human's broker (see
+  # approval-daemon.nix) and runs the command on approval.
 
-  socketPath = "/run/nuketown-broker/socket";
-
-  # Shared by the root-side wrappers (sudo-with-approval, sudoex-run).
-  # These run as root via sudo, so the requesting user comes from sudo's
-  # SUDO_USER and the broker is asked from root: on the path that grants
-  # root, the agent never talks to the broker itself. argv is rendered
-  # with %q so the dialog shows exactly what will run, on one line (a
-  # newline in an argument can't start a second request line).
-  #
-  # approval_request <requirements> <display-cmd>: returns 0 if approved.
-  approvalRequestFn = ''
-    approval_request() {
-      local requirements="$1" display="$2" mock_mode response
-      local socket_path="${socketPath}"
-      local mock_file="/run/nuketown-broker/mode"
-      local requesting_user="''${SUDO_USER:-$(${pkgs.coreutils}/bin/id -un)}"
-
-      # Check for mock approval mode (for testing)
-      if [ -f "$mock_file" ]; then
-        mock_mode=$(${pkgs.coreutils}/bin/tr -d '\n\r ' < "$mock_file")
-        if [ "$mock_mode" = "MOCK_APPROVED" ]; then
-          echo "[MOCK] Auto-approved: $display" >&2
-          return 0
-        elif [ "$mock_mode" = "MOCK_DENIED" ]; then
-          echo "[MOCK] Auto-denied: $display" >&2
-          return 1
-        else
-          echo "Error: Invalid mock mode in $mock_file (got: '$mock_mode')" >&2
-          echo "Expected: MOCK_APPROVED or MOCK_DENIED" >&2
-          return 1
-        fi
-      fi
-
-      if [ ! -S "$socket_path" ]; then
-        echo "Error: Approval daemon is not running (socket not found at $socket_path)" >&2
-        return 1
-      fi
-
-      response=$(printf "%sSUDO:%s:%s\n\n" "$requirements" "$requesting_user" "$display" | \
-        ${pkgs.socat}/bin/socat STDIO,ignoreeof UNIX-CONNECT:"$socket_path" || echo "ERROR")
-
-      if [ "$response" = "APPROVED" ]; then
-        return 0
-      elif [ "$response" = "DENIED" ]; then
-        echo "Request denied." >&2
-        return 1
-      else
-        echo "Error communicating with approval daemon (got: '$response')" >&2
-        return 1
-      fi
-    }
-
-    # Render argv as one shell-quoted line.
-    quote_argv() {
-      local out
-      printf -v out '%q ' "$@"
-      printf '%s' "''${out% }"
-    }
-  '';
-
-  approvalWrapper = pkgs.writeShellScriptBin "sudo-with-approval" ''
-    set -e
-    ${approvalRequestFn}
-
-    if [ $# -eq 0 ]; then
-      echo "Usage: sudo sudo-with-approval <command>" >&2
-      exit 1
-    fi
-
-    if approval_request "" "$(quote_argv "$@")"; then
-      exec ${pkgs.sudo}/bin/sudo "$@"
-    fi
-    exit 1
-  '';
+  approveCmd = "/run/wrappers/bin/sudo -u nuketown-approval /run/current-system/sw/bin/nuketown-approve";
 
   # ── Sops Helpers ───────────────────────────────────────────────
   # sops-unlock: sends a DECRYPT request to the broker socket
   sopsUnlock = pkgs.writeShellScriptBin "sops-unlock" ''
-    set -e
-
-    SOCKET_PATH="${socketPath}"
-
-    if [ ! -S "$SOCKET_PATH" ]; then
-      echo "Error: Broker daemon is not running (socket not found at $SOCKET_PATH)" >&2
-      exit 1
-    fi
-
     echo "Requesting YubiKey decrypt via broker..." >&2
-
-    RESPONSE=$(printf "%s\n\n" "DECRYPT:/etc/sops-age-key.gpg:/run/sops-age/keys.txt" | \
-      ${pkgs.socat}/bin/socat STDIO,ignoreeof UNIX-CONNECT:"$SOCKET_PATH" || echo "ERROR")
-
-    if [ "$RESPONSE" = "DECRYPTED" ]; then
+    if ${approveCmd} --decrypt-only --decrypt /etc/sops-age-key.gpg:/run/sops-age/keys.txt; then
       echo "Age key unlocked." >&2
-    elif [ "$RESPONSE" = "DENIED" ]; then
-      echo "Decrypt denied or failed." >&2
-      exit 1
     else
-      echo "Error communicating with broker (got: '$RESPONSE')" >&2
+      echo "Decrypt denied or failed." >&2
       exit 1
     fi
   '';
@@ -117,55 +29,25 @@ let
     echo "Age key locked." >&2
   '';
 
-  # sudoex: extended sudo with composable requirements
-  # Agent-side front end; the root-side sudoex-run asks the broker.
-  # Usage: sudoex [--decrypt src:dest] [--] <command...>
+  # sudoex: extended sudo with composable requirements (one popup for
+  # decrypt + command).
+  # Usage: sudoex [--decrypt src:dest]... [--why text] [--] <command...>
   sudoex = pkgs.writeShellScriptBin "sudoex" ''
-    if [ $# -eq 0 ]; then
-      echo "Usage: sudoex [--decrypt src:dest] [--] <command...>" >&2
-      exit 1
-    fi
-
-    exec /run/wrappers/bin/sudo /run/current-system/sw/bin/sudoex-run "$@"
-  '';
-
-  # sudoex-run: root-side target of sudoex. Sends all requirements + SUDO
-  # to the broker on one connection (one popup), then execs on approval.
-  sudoexRun = pkgs.writeShellScriptBin "sudoex-run" ''
-    set -e
-    ${approvalRequestFn}
-
-    REQUIREMENTS=""
+    args=()
     while [[ $# -gt 0 ]]; do
       case $1 in
-        --decrypt)
-          # The broker protocol is line- and colon-delimited.
-          if [[ "''${2-}" != *:* || "$2" == *$'\n'* || "$2" == *$'\r'* ]]; then
-            echo "Error: --decrypt takes src:dest" >&2
-            exit 1
-          fi
-          REQUIREMENTS="''${REQUIREMENTS}DECRYPT:$2"$'\n'
-          shift 2
-          ;;
-        --)
-          shift
-          break
-          ;;
-        *)
-          break
-          ;;
+        --decrypt|--why) args+=("$1" "''${2-}"); shift 2 ;;
+        --) shift; break ;;
+        *) break ;;
       esac
     done
 
     if [ $# -eq 0 ]; then
-      echo "Usage: sudoex [--decrypt src:dest] [--] <command...>" >&2
+      echo "Usage: sudoex [--decrypt src:dest]... [--why text] [--] <command...>" >&2
       exit 1
     fi
 
-    if approval_request "$REQUIREMENTS" "$(quote_argv "$@")"; then
-      exec "$@"
-    fi
-    exit 1
+    exec ${approveCmd} --cwd "$PWD" "''${args[@]}" -- "$@"
   '';
 
   # nuketown-switch: convenience wrapper for switch-with-secrets
@@ -183,42 +65,36 @@ let
     exit $RC
   '';
 
-  # Shadow sudo binary for agents — parses sudo flags and redirects to approval wrapper
+  # Shadow sudo binary for agents: maps the sudo flags that make sense
+  # here onto nuketown-approve, which runs the command after approval.
+  # `--why <text>` (not a real sudo flag) tells the reviewer and the human
+  # what the command is for.
   sudoShim = pkgs.writeShellScriptBin "sudo" ''
-    # Parse sudo flags
-    flags=()
+    args=()
     while [[ $# -gt 0 ]]; do
       case $1 in
-        -u|-g|-C|-D|-p|-r|-t|-T|-U)
-          # Flags that take an argument
-          flags+=("$1" "$2")
-          shift 2
-          ;;
-        -A|-b|-E|-H|-i|-k|-K|-l|-n|-P|-S|-s|-V|-v)
-          # Flags that don't take an argument
-          flags+=("$1")
-          shift
-          ;;
-        --)
-          # End of flags marker
-          shift
-          break
-          ;;
+        -u) args+=(--user "''${2-}"); shift 2 ;;
+        -g) args+=(--group "''${2-}"); shift 2 ;;
+        -D) cd -- "''${2-}" || exit 1; shift 2 ;;
+        -H) args+=(--set-home); shift ;;
+        -i) args+=(--login); shift ;;
+        -s) args+=(--shell); shift ;;
+        --why) args+=(--why "''${2-}"); shift 2 ;;
+        # No password and a reset environment: these change nothing here.
+        -n|-E|-k|-S|-A|-P|-b) shift ;;
+        -p) shift 2 ;;
+        -K) exit 0 ;;
+        -l|-v|-V) exec /run/wrappers/bin/sudo "$@" ;;
+        --) shift; break ;;
         -*)
-          # Unknown flag, pass it through
-          flags+=("$1")
-          shift
+          echo "sudo (nuketown): unsupported option $1" >&2
+          exit 1
           ;;
-        *)
-          # First non-flag argument, this is the command
-          break
-          ;;
+        *) break ;;
       esac
     done
 
-    # Now $@ contains only the command and its arguments
-    # Pass flags to sudo-with-approval, which will execute sudo with them after approval
-    exec /run/wrappers/bin/sudo sudo-with-approval "''${flags[@]}" "$@"
+    exec ${approveCmd} --cwd "$PWD" "''${args[@]}" -- "$@"
   '';
 
   # ── Agent Options ───────────────────────────────────────────────
@@ -351,11 +227,21 @@ let
             human's desktop. The agent never gets a password.
           '';
         };
+        approvalAllow = lib.mkOption {
+          type = lib.types.nullOr (lib.types.listOf lib.types.str);
+          default = null;
+          description = ''
+            Commands (absolute paths, or names looked up in the system
+            PATH) this agent may request. Requests for anything else are
+            refused before the human is asked. null = any command.
+          '';
+        };
         commands = lib.mkOption {
           type = lib.types.listOf lib.types.str;
           default = [];
           description = ''
-            Specific commands the agent is allowed to sudo.
+            Deprecated alias for approvalAllow (used when approvalAllow is
+            null). Every command still needs approval.
             Empty list = can request approval for any command.
           '';
         };
@@ -613,7 +499,11 @@ let
       approve or deny each invocation.
 
       - **`sudo`**: Routes through the approval daemon. Use sparingly and
-        batch privileged operations when possible.
+        batch privileged operations when possible. Add `--why "<reason>"`
+        (e.g. `sudo --why "restart wifi after config change" systemctl
+        restart iwd`) so the human and the reviewer know what it's for.
+        Scripts you run are snapshotted when you ask; the snapshot is what
+        runs, so finish editing before requesting.
       - **`sudoex`**: Extended sudo that can also decrypt secrets (e.g.
         `sudoex --decrypt src:dest -- command`). Used by `nuketown-switch`.
       - **`nuketown-switch`**: The standard way to apply NixOS configuration
@@ -834,6 +724,8 @@ in
     };
   };
 
+  imports = [ ./approval.nix ];
+
   config = lib.mkIf cfg.enable ({
 
     # Ensure humanUser is set when sudo agents exist
@@ -853,8 +745,7 @@ in
     # The agent works in its own clone at <agentsDir>/<agent>/projects/<project>.
 
     environment.systemPackages =
-      (lib.optionals (sudoAgents != {}) [ approvalWrapper sudoexRun ])
-      ++ lib.concatLists (lib.mapAttrsToList (name: agent:
+      lib.concatLists (lib.mapAttrsToList (name: agent:
         lib.optional agent.portal.enable (
           let
             splitPercent = let
@@ -1009,7 +900,6 @@ in
         isNormalUser = true;
         home = "${cfg.agentsDir}/${name}";
         shell = pkgs.bash;
-        extraGroups = lib.optional agent.sudo.enable "nuketown-broker";
         linger = agent.daemon.enable;
       }) enabledAgents)
       # Human user needs nuketown-secrets to write decrypted keys via broker
@@ -1199,34 +1089,7 @@ in
 
     # ── Sudo Approval System ─────────────────────────────────────
 
-    # Allow agents to run the approval wrapper via sudo without a password.
-    # The wrapper itself gates execution behind the zenity approval dialog.
-    security.sudo.extraRules =
-      lib.concatLists (lib.mapAttrsToList (name: agent:
-        lib.optional agent.sudo.enable {
-          users = [ name ];
-          runAs = "root:root";
-          commands =
-            if agent.sudo.commands == []
-            then [
-              {
-                command = "/run/current-system/sw/bin/sudo-with-approval";
-                options = [ "NOPASSWD" ];
-              }
-              {
-                command = "/run/current-system/sw/bin/sudoex-run";
-                options = [ "NOPASSWD" ];
-              }
-            ]
-            else map (cmd: {
-              command = cmd;
-              options = [ "NOPASSWD" ];
-            }) agent.sudo.commands;
-        }
-      ) enabledAgents)
-      # machinectl sudo rule removed — polkit handles authorization
-      # (see security.polkit.extraConfig below)
-      ;
+    # Agent sudo rules (agent -> nuketown-approval only) live in approval.nix.
 
     # Polkit rule: allow the human to use machinectl shell for portal access.
     # Using polkit instead of sudo because machinectl talks to machined over

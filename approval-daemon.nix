@@ -12,9 +12,81 @@ let
     }
   '';
 
+  runDir = "/run/nuketown-approval";
+
+  # Renders a request directory (written by nuketown-approve, see
+  # approval.nix) as Pango markup for the zenity dialog. Everything the
+  # agent or the reviewer wrote is escaped; backslashes are doubled
+  # because zenity unescapes \n etc. in --text.
+  renderRequest = pkgs.writeText "nuketown-render-request.jq" ''
+    def esc: gsub("\\\\"; "\\\\") | gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;");
+    def cut(n): if length > n then .[0:n] + "…" else . end;
+    def bullets: map("\n  • " + (cut(300) | esc)) | join("");
+    ($req[0]) as $r
+    | (($rev[0]) // {status: "missing"}) as $v
+    | "Agent <b>\($r.requester | esc)</b> wants to run as <b>\($r.run_as.user | esc)</b>:\n\n"
+      + "<tt>\($r.display | cut(800) | esc)</tt>"
+      + (if $r.why != "" then "\n\n<b>Agent's stated reason:</b> <i>\($r.why | cut(400) | esc)</i>" else "" end)
+      + (if ($r.snapshots | length) > 0
+         then "\n\n<b>Files</b> (snapshotted; the snapshot is what runs): "
+              + ([$r.snapshots[] | (.path | esc) + (if .executed then " (runs)" else "" end)] | join(", "))
+         else "" end)
+      + "\n\n"
+      + (if $v.status == "ok" then
+           "<b>Reviewer</b>: risk <b>\($v.risk | ascii_upcase)</b>, recommends <b>\($v.recommendation | ascii_upcase)</b>\n"
+           + ($v.summary | cut(1500) | esc)
+           + (if ($v.notes | length) > 0 then "\n<b>Concerns:</b>" + ($v.notes | bullets) else "" end)
+           + (if ($v.not_shown | length) > 0 then "\n<b>Could not verify:</b>" + ($v.not_shown | bullets) else "" end)
+         elif $v.status == "disabled" then "<i>No reviewer configured.</i>"
+         else "<b>No review</b>: " + (($v.reason // $v.status) | esc)
+         end)
+  '';
+
+  # Default prompter: zenity, with a "Show files" button when the request
+  # has snapshots. Exit 0 = approve.
+  zenityPrompter = pkgs.writeShellScript "nuketown-zenity-prompter" ''
+    set -uo pipefail
+    DIR=$1
+    TEXT=$(${pkgs.jq}/bin/jq -rn --slurpfile req "$DIR/request.json" \
+      --slurpfile rev <(cat "$DIR/review.json" 2>/dev/null || true) \
+      -f ${renderRequest}) || exit 1
+    FILES=$(${pkgs.coreutils}/bin/mktemp)
+    trap '${pkgs.coreutils}/bin/rm -f "$FILES"' EXIT
+    NSNAP=0
+    while IFS= read -r -d "" path && IFS= read -r -d "" snap && IFS= read -r -d "" sha; do
+      [[ "$snap" == snapshots/* && "$snap" != *..* ]] || continue
+      NSNAP=$((NSNAP + 1))
+      printf '==== %s\n==== sha256 %s\n\n' "$path" "$sha" >> "$FILES"
+      ${pkgs.coreutils}/bin/head -c 1048576 "$DIR/$snap" >> "$FILES"
+      printf '\n\n' >> "$FILES"
+    done < <(${pkgs.jq}/bin/jq -j '.snapshots[] | .path, "\u0000", .snapshot, "\u0000", .sha256, "\u0000"' "$DIR/request.json")
+    EXTRA=()
+    [ "$NSNAP" -gt 0 ] && EXTRA=(--extra-button "Show files")
+    while true; do
+      OUT=$(${pkgs.zenity}/bin/zenity --question \
+        --title="Nuketown: Sudo Approval" \
+        --text="$TEXT" \
+        --ok-label="Approve" --cancel-label="Deny" --default-cancel \
+        --width=640 --timeout=120 "''${EXTRA[@]}" 2>/dev/null)
+      RC=$?
+      [ $RC -eq 0 ] && exit 0
+      if [ "$OUT" = "Show files" ]; then
+        ${pkgs.zenity}/bin/zenity --text-info --title="Nuketown: files in this request" \
+          --filename="$FILES" --width=900 --height=700 2>/dev/null
+        continue
+      fi
+      exit 1
+    done
+  '';
+
+  prompter = if cfg.prompter != null then cfg.prompter else "${zenityPrompter}";
+
   # ── Multi-op Broker Handler ─────────────────────────────────
   # Reads all ops from a connection, then decides how to fulfill them.
-  # A DECRYPT + SUDO = combined flow: one popup, one YubiKey touch.
+  # Only the nuketown-approval service user can connect (socket group).
+  #   REQUEST:<id>            a sudo request; details in ${runDir}/<id>
+  #   DECRYPT:<src>:<dest>    decrypt with the human's GPG key (YubiKey)
+  # DECRYPT + REQUEST = combined flow: one popup, one YubiKey touch.
   brokerHandler = pkgs.writeShellScript "nuketown-broker-handler" ''
     set -uo pipefail
     ${escapeHtml}
@@ -22,9 +94,7 @@ let
     # ── Read all ops from the connection ──────────────────────
     DECRYPT_SRC=""
     DECRYPT_DEST=""
-    SUDO_USER=""
-    SUDO_COMMAND=""
-    LEGACY_LINES=()
+    REQ_ID=""
 
     while IFS= read -r REQUEST && [ -n "$REQUEST" ]; do
       OP=$(echo "$REQUEST" | ${pkgs.coreutils}/bin/cut -d: -f1)
@@ -34,24 +104,47 @@ let
           DECRYPT_SRC=$(echo "$REQUEST" | ${pkgs.coreutils}/bin/cut -d: -f2)
           DECRYPT_DEST=$(echo "$REQUEST" | ${pkgs.coreutils}/bin/cut -d: -f3)
           ;;
-        SUDO)
-          SUDO_USER=$(echo "$REQUEST" | ${pkgs.coreutils}/bin/cut -d: -f2)
-          SUDO_COMMAND=$(echo "$REQUEST" | ${pkgs.coreutils}/bin/cut -d: -f3-)
+        REQUEST)
+          REQ_ID=''${REQUEST#REQUEST:}
+          if [[ ! "$REQ_ID" =~ ^[A-Za-z0-9._-]+$ ]] || [ ! -f "${runDir}/$REQ_ID/request.json" ]; then
+            echo "ERROR: unknown request"
+            exit 0
+          fi
           ;;
         *)
-          # Legacy: username:command
-          SUDO_USER=$(echo "$REQUEST" | ${pkgs.coreutils}/bin/cut -d: -f1)
-          SUDO_COMMAND=$(echo "$REQUEST" | ${pkgs.coreutils}/bin/cut -d: -f2-)
+          echo "ERROR: unknown operation"
+          exit 0
           ;;
       esac
     done
+    REQ_DIR="${runDir}/$REQ_ID"
 
     # ── Decide how to handle the request set ──────────────────
 
-    # Combined: DECRYPT + SUDO = one popup with command context, one YubiKey touch
-    if [ -n "$DECRYPT_SRC" ] && [ -n "$SUDO_USER" ]; then
-      USER_ESC=$(escape_html "$SUDO_USER")
-      COMMAND_ESC=$(escape_html "$SUDO_COMMAND")
+    # Custom prompter: ask first, then decrypt (one YubiKey touch).
+    if [ -n "$REQ_ID" ] && [ ${if cfg.prompter != null then "1" else "0"} = 1 ]; then
+      if ! ${prompter} "$REQ_DIR" < /dev/null > /dev/null 2>&1; then
+        echo "DENIED"
+        exit 0
+      fi
+      if [ -n "$DECRYPT_SRC" ]; then
+        TMPFILE=$(${pkgs.coreutils}/bin/mktemp)
+        trap 'rm -f "$TMPFILE"' EXIT
+        if ! ${pkgs.gnupg}/bin/gpg -d "$DECRYPT_SRC" > "$TMPFILE" 2>/dev/null; then
+          echo "DENIED"
+          exit 0
+        fi
+        ${pkgs.coreutils}/bin/install -m 600 "$TMPFILE" "$DECRYPT_DEST"
+      fi
+      echo "APPROVED"
+      exit 0
+    fi
+
+    # Combined: DECRYPT + REQUEST = one popup with command context, one YubiKey touch
+    if [ -n "$DECRYPT_SRC" ] && [ -n "$REQ_ID" ]; then
+      REQ_TEXT=$(${pkgs.jq}/bin/jq -rn --slurpfile req "$REQ_DIR/request.json" \
+        --slurpfile rev <(cat "$REQ_DIR/review.json" 2>/dev/null || true) \
+        -f ${renderRequest}) || { echo "ERROR: bad request"; exit 0; }
 
       TMPFILE=$(${pkgs.coreutils}/bin/mktemp)
       cleanup() {
@@ -67,11 +160,11 @@ let
       ${pkgs.zenity}/bin/zenity \
           --question \
           --title="Nuketown: Approval" \
-          --text="Agent <b>$USER_ESC</b> wants to run:\n\n<tt>$COMMAND_ESC</tt>\n\nThis requires unlocking secrets.\nTouch YubiKey to approve, or click Deny." \
+          --text="$REQ_TEXT\n\nThis requires unlocking secrets.\nTouch YubiKey to approve, or click Deny." \
           --ok-label="Approve" \
           --cancel-label="Deny" \
           --default-cancel \
-          --width=500 \
+          --width=640 \
           2>/dev/null &
       ZENITY_PID=$!
 
@@ -218,21 +311,9 @@ let
       exit 0
     fi
 
-    # SUDO only (no decrypt)
-    if [ -n "$SUDO_USER" ]; then
-      USER_ESC=$(escape_html "$SUDO_USER")
-      COMMAND_ESC=$(escape_html "$SUDO_COMMAND")
-
-      if ${pkgs.zenity}/bin/zenity \
-          --question \
-          --title="Nuketown: Sudo Approval" \
-          --text="Agent <b>$USER_ESC</b> wants to run:\n\n<tt>$COMMAND_ESC</tt>\n\nApprove?" \
-          --ok-label="Approve" \
-          --cancel-label="Deny" \
-          --default-cancel \
-          --width=500 \
-          --timeout=60 \
-          2>/dev/null; then
+    # REQUEST only (no decrypt)
+    if [ -n "$REQ_ID" ]; then
+      if ${prompter} "$REQ_DIR" < /dev/null > /dev/null 2>&1; then
         echo "APPROVED"
       else
         echo "DENIED"
@@ -449,6 +530,18 @@ in
 {
   options.nuketown.approvalDaemon = {
     enable = lib.mkEnableOption "Nuketown operation broker";
+
+    prompter = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        Command that asks the human about a sudo request. It gets the
+        request directory (request.json, review.json, snapshots/) as its
+        only argument and exits 0 to approve, anything else to deny.
+        null uses the built-in zenity dialog. With a custom prompter, a
+        decrypt (sudoex --decrypt) runs after approval.
+      '';
+    };
 
     xmpp = {
       enable = lib.mkEnableOption "XMPP client for the approval broker";

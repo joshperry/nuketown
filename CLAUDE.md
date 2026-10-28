@@ -53,6 +53,7 @@ Agent home directories live on a btrfs subvolume (`@agents`) that rolls back to 
 ```
 nuketown/
 ├── module.nix            # Main NixOS module (~770 lines)
+├── approval.nix          # nuketown-approval service user (sudo requests, snapshots, reviewer, audit)
 ├── approval-daemon.nix   # Home-manager module for sudo approval daemon
 ├── checks.nix            # Pure nix evaluation checks (nix flake check)
 ├── flake.nix             # Flake: test VMs, dev shell, apps, checks
@@ -62,7 +63,10 @@ nuketown/
 │   ├── lib.sh            # Test utilities (SSH helpers, assertions)
 │   ├── run-tests.sh      # Test runner (discovers and runs all suites)
 │   ├── simple-test.sh    # Agent E2E tests (user, identity, git, prompt)
-│   └── sudo-approval-mock.sh  # Mock approval test suite
+│   ├── sudo-approval-mock.sh  # Mock approval test suite
+│   ├── approval-node.nix      # Shared VM node for the approval NixOS tests
+│   ├── sudo-approval-bypass.nix  # VM check: no path to root without approval
+│   └── approval-flow.nix      # VM check: snapshots, reviewer, decrypt, audit
 ├── README.md             # User-facing documentation
 ├── CLAUDE.md             # This file - developer guidance
 └── docs/testing.md       # Testing session notes
@@ -95,7 +99,7 @@ The main module provides `config.nuketown` options:
 - `persist`: Directories to persist across reboots (via impermanence)
 - `secrets.{sshKey,gpgKey,extraSecrets}`: sops-nix secret names
 - `devices`: List of udev device rules (see Device Access below)
-- `sudo.{enable,commands}`: Interactive sudo approval system
+- `sudo.{enable,approvalAllow}`: Interactive sudo approval system (`commands` is a deprecated alias for `approvalAllow`)
 - `portal.{enable,command,layout}`: Tmux portal configuration
 
 ### Device Access
@@ -130,11 +134,23 @@ The module automatically:
 
 When `sudo.enable = true` for an agent:
 
-1. Agent's home-manager gets a sudo shim that calls `/run/wrappers/bin/sudo sudo-with-approval`
-2. The wrapper connects to `/run/sudo-approval/socket` and sends approval request
-3. Approval daemon (runs under human's graphical session) shows zenity dialog
-4. On approval, wrapper execs the real command with sudo
+1. Agent's home-manager gets a `sudo` shim (and `sudoex`, `sops-unlock`) that runs
+   `sudo -u nuketown-approval nuketown-approve ... -- <argv>`. That is the agent's
+   only sudo rule; it has no rule that reaches root.
+2. `nuketown-approve` (approval.nix) runs as the unprivileged `nuketown-approval`
+   service user. It writes `/run/nuketown-approval/<id>/request.json`, snapshots
+   any script that will run (reading it *as the agent*, via sudo) and rewrites
+   argv to run the snapshot, and optionally runs the reviewer agent
+   (`nuketown.approval.reviewer`) for a plain-English analysis.
+3. It sends `REQUEST:<id>` to the human's broker (approval-daemon.nix), the only
+   other member of the broker socket's group. The broker shows the request
+   (zenity by default, or `nuketown.approvalDaemon.prompter`).
+4. On approval the service user runs the command with sudo, passing stdio and the
+   exit code through, and writes a journal record (`-t nuketown-approval`) and an
+   audit copy under `nuketown.approval.audit.dir`.
 
+The service user is root-equivalent by design; the point is that every
+privileged step it takes is a logged sudo call and root never parses requests.
 The agent never has a password - all sudo access requires interactive approval.
 
 ### Portal System

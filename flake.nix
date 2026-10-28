@@ -553,6 +553,11 @@
             inherit nixpkgs-unstable home-manager impermanence sops-nix;
             nuketownModule = ./module.nix;
           };
+          vm-approval-flow = import ./tests/approval-flow.nix {
+            pkgs = pkgsFor system;
+            inherit nixpkgs-unstable home-manager impermanence sops-nix;
+            nuketownModule = ./module.nix;
+          };
         }
       );
 

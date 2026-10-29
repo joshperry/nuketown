@@ -55,10 +55,13 @@ let
 
   # Runs the approved command in the requester's directory (or / if the
   # run-as user can't enter it, which is where sudo would leave it unable
-  # to resolve relative paths anyway), with the system PATH.
+  # to resolve relative paths anyway), with the system PATH and
+  # NUKETOWN_APPROVAL_DIR set to the request directory (deleted after
+  # the command exits; copy what you need).
   runIn = pkgs.writeShellScript "nuketown-run-in" ''
     cd -- "$1" 2>/dev/null || cd /
-    shift
+    export NUKETOWN_APPROVAL_DIR=$2
+    shift 2
     export PATH=/run/wrappers/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin
     exec "$@"
   '';
@@ -100,10 +103,16 @@ let
     set -uo pipefail
     dir=$1
     export PATH="/etc/profiles/per-user/$(${pkgs.coreutils}/bin/id -un)/bin:/run/current-system/sw/bin:$PATH"
+    prompt=$(${pkgs.jq}/bin/jq -r '.kind.review_prompt // empty' "$dir/request.json")
     {
-      ${pkgs.coreutils}/bin/cat ${reviewPrompt}
+      ${pkgs.coreutils}/bin/cat "''${prompt:-${reviewPrompt}}"
       printf '\n## request.json\n\n'
       ${pkgs.coreutils}/bin/cat "$dir/request.json"
+      for f in "$dir"/kind/*; do
+        [ -f "$f" ] || continue
+        printf '\n## %s\n\n' "''${f#"$dir"/}"
+        ${pkgs.coreutils}/bin/head -c 200000 "$f"
+      done
       for f in "$dir"/snapshots/*/*; do
         [ -f "$f" ] || continue
         printf '\n## snapshot %s\n\n' "''${f#"$dir"/}"
@@ -128,9 +137,17 @@ let
     }); ALLOW_ANY=${if l == null then "1" else "0"} ;;"
   ) sudoAgents);
 
+  # Request kinds: resolved command path -> name, collector, prompt, timeout.
+  kindCase = lib.concatStringsSep "\n" (lib.mapAttrsToList (name: k:
+    "      ${lib.escapeShellArg k.command}) KIND=${lib.escapeShellArg name}"
+    + " KIND_COLLECT=${lib.escapeShellArg (if k.collect == null then "" else k.collect)}"
+    + " KIND_PROMPT=${lib.escapeShellArg (if k.reviewPrompt == null then "" else k.reviewPrompt)}"
+    + " PROMPT_TIMEOUT=${toString k.timeout} ;;"
+  ) acfg.kinds);
+
   approve = pkgs.writeShellScriptBin "nuketown-approve" ''
     set -uo pipefail
-    export PATH=${lib.makeBinPath (with pkgs; [ coreutils jq socat gnused findutils systemd ])}
+    export PATH=${lib.makeBinPath (with pkgs; [ coreutils jq socat gnused findutils systemd procps ])}
     SUDO=/run/wrappers/bin/sudo
     SYSPATH=/run/wrappers/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin
 
@@ -153,11 +170,21 @@ let
     }
 
     [ "$(id -un)" = ${user} ] || die "must run as ${user} (via sudo -u ${user})"
-    REQUESTER=''${SUDO_USER-}
-    case "$REQUESTER" in
+    CALLER=''${SUDO_USER-}
+    REQUESTER=$CALLER ORIGIN=agent READ_AS=$CALLER
+    # Root (loom-switch-request via pkexec, timers) may name the requester.
+    if [ "''${1-}" = --requester ]; then
+      [ "$CALLER" = root ] || die "--requester is only accepted from root"
+      REQUESTER=''${2-}
+      [[ "$REQUESTER" =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]] || die "bad --requester name"
+      ORIGIN=root READ_AS=root ALLOW_ANY=1 ALLOW=()
+      shift 2
+    else
+      case "$REQUESTER" in
 ${agentCase}
-      *) die "requester '$REQUESTER' is not a sudo-enabled nuketown agent" ;;
-    esac
+        *) die "requester '$REQUESTER' is not a sudo-enabled nuketown agent" ;;
+      esac
+    fi
     cd /
 
     # ── Arguments ────────────────────────────────────────────────
@@ -179,6 +206,7 @@ ${agentCase}
         --shell) SHELLMODE=1; shift ;;
         --set-home) SETHOME=1; shift ;;
         --decrypt-only) DECRYPT_ONLY=1; shift ;;
+        --requester) die "--requester must come first (and only from root)" ;;
         --) shift; break ;;
         *) die "unknown option: $1" ;;
       esac
@@ -200,9 +228,13 @@ ${agentCase}
     # setgid parent: everything here is group ${readGroup} (human, reviewer)
     mkdir -m 2751 "$DIR" "$DIR/snapshots" || die "cannot create $DIR"
     chmod 0755 "$DIR/snapshots"
-    DECISION="error" PROMPTER="none" RC=1 EXEC_ARGV=() SNAPS="[]"
+    DECISION="error" PROMPTER="none" RC=1 EXEC_ARGV=() SNAPS="[]" REASON=""
+    KIND="" KIND_COLLECT="" KIND_PROMPT="" PROMPT_TIMEOUT=${toString acfg.promptTimeout}
+    REVIEW_PID=""
+    cancel_review() { :; }   # replaced once a review can be running
 
     finish() {
+      cancel_review
       local review='{}'
       [ -f "$DIR/review.json" ] && review=$(cat "$DIR/review.json")
       local rec
@@ -211,10 +243,13 @@ ${agentCase}
         --argjson exec_argv "$(json_array "''${EXEC_ARGV[@]}")" \
         --argjson snapshots "$SNAPS" --argjson review "$review" \
         --arg decision "$DECISION" --arg prompter "$PROMPTER" --argjson exit "$RC" \
-        '{id:$id, requester:$requester, argv:$argv, exec_argv:$exec_argv,
+        --arg origin "$ORIGIN" --arg kind "$KIND" --arg reason "$REASON" \
+        '{id:$id, requester:$requester, origin:$origin, kind:(if $kind == "" then null else $kind end),
+          argv:$argv, exec_argv:$exec_argv,
           snapshots:[$snapshots[] | {path, sha256}],
           review:{status:$review.status, risk:$review.risk, recommendation:$review.recommendation},
-          decision:$decision, prompter:$prompter, exit:$exit}')
+          decision:$decision, reason:(if $reason == "" then null else $reason end),
+          prompter:$prompter, exit:$exit}')
       printf '%s\n' "$rec" | systemd-cat -t nuketown-approval || true
       printf '%s\n' "$rec" > "$DIR/decision.json" 2>/dev/null || true
       ${lib.optionalString (acfg.audit.dir != null) ''
@@ -258,15 +293,15 @@ ${agentCase}
       base=$(basename -- "$path")
       mkdir -m 0755 "$DIR/snapshots/$NSNAP"
       dst="$DIR/snapshots/$NSNAP/$base"
-      "$SUDO" -u "$REQUESTER" -- ${readHelper} "$path" > "$dst" < /dev/null
+      "$SUDO" -u "$READ_AS" -- ${readHelper} "$path" > "$dst" < /dev/null
       rc=$?
       if [ $rc -ne 0 ]; then
         rm -rf "$DIR/snapshots/$NSNAP"
         if [ "$req" = 1 ] || [ $rc -eq 2 ] || [ $rc -eq 4 ]; then
           case $rc in
-            5) die "$path does not exist (or $REQUESTER cannot see it)" ;;
+            5) die "$path does not exist (or $READ_AS cannot see it)" ;;
             3) die "$path is not a regular file" ;;
-            2) die "$REQUESTER cannot read $path" ;;
+            2) die "$READ_AS cannot read $path" ;;
             4) die "$path is larger than ${toString acfg.snapshotMaxBytes} bytes" ;;
             *) die "could not snapshot $path" ;;
           esac
@@ -299,6 +334,10 @@ ${agentCase}
         done
         [ $ok = 1 ] || die "$REQUESTER may not request $ARG0 (not in sudo.approvalAllow)"
       fi
+
+      case "$ARG0" in
+${kindCase}
+      esac
 
       SNAPPED=()
       if ! is_system "$ARG0"; then
@@ -354,17 +393,36 @@ ${agentCase}
       --argjson argv "$(json_array "''${ARGV[@]}")" \
       --argjson exec_argv "$(json_array "''${EXEC_ARGV[@]}")" \
       --argjson decrypt "$(json_array "''${DECRYPTS[@]}")" \
-      --argjson snapshots "$SNAPS" \
-      '{id:$id, requester:$requester, time:$time, cwd:$cwd, why:$why,
+      --argjson snapshots "$SNAPS" --arg origin "$ORIGIN" \
+      --arg kind "$KIND" --arg kind_prompt "$KIND_PROMPT" --argjson prompt_timeout "$PROMPT_TIMEOUT" \
+      '{id:$id, requester:$requester, origin:$origin, time:$time, cwd:$cwd, why:$why,
+        kind:(if $kind == "" then null else {name:$kind, review_prompt:(if $kind_prompt == "" then null else $kind_prompt end)} end),
+        prompt_timeout:$prompt_timeout,
         run_as:{user:(if $user == "" then "root" else $user end), group:$group,
                 login:($login == 1), shell:($shell == 1), set_home:($set_home == 1)},
         argv:$argv, exec_argv:$exec_argv, display:$display, decrypt:$decrypt,
         snapshots:$snapshots}' > "$DIR/request.json"
     chmod 0640 "$DIR/request.json"
 
-    # ── Review ───────────────────────────────────────────────────
-    write_review() { jq -n "$@" > "$DIR/review.json"; chmod 0640 "$DIR/review.json"; }
-    if [ ${if reviewerEnabled then "1" else "0"} = 1 ] && [ "$DECRYPT_ONLY" = 0 ]; then
+    # ── Kind collector (root) ────────────────────────────────────
+    if [ -n "$KIND_COLLECT" ]; then
+      mkdir -m 2755 "$DIR/kind"
+      "$SUDO" -- "$KIND_COLLECT" "$DIR" < /dev/null > "$DIR/kind/collect.log"
+      rc=$?
+      if [ $rc -ne 0 ]; then
+        DECISION=refused REASON="$KIND collector refused (exit $rc)"
+        RC=$rc; exit $rc
+      fi
+    fi
+
+    # ── Review (in the background; the ask may start before it lands) ──
+    # review.json is replaced atomically: pending -> ok | unavailable.
+    write_review() {
+      jq -n "$@" > "$DIR/review.json.tmp" && chmod 0640 "$DIR/review.json.tmp" \
+        && mv -f "$DIR/review.json.tmp" "$DIR/review.json"
+    }
+    run_review() {
+      local out rc
       out=$(timeout --kill-after=5 ${toString acfg.reviewer.timeout} \
               "$SUDO" -H -u ${lib.escapeShellArg (toString acfg.reviewer.agent)} -- ${reviewCommand} "$DIR" \
               < /dev/null 2> "$DIR/review.stderr" | head -c 65536)
@@ -381,13 +439,41 @@ ${agentCase}
              ((.not_shown // []) | type == "array")' > /dev/null 2>&1; then
         printf '%s' "$out" | jq '{status:"ok", summary:.summary[0:2000], risk, recommendation,
           notes:((.notes // []) | map(tostring | .[0:500]) | .[0:20]),
-          not_shown:((.not_shown // []) | map(tostring | .[0:500]) | .[0:20])}' > "$DIR/review.json"
-        chmod 0640 "$DIR/review.json"
+          not_shown:((.not_shown // []) | map(tostring | .[0:500]) | .[0:20])}' > "$DIR/review.json.tmp" \
+          && chmod 0640 "$DIR/review.json.tmp" && mv -f "$DIR/review.json.tmp" "$DIR/review.json"
       else
         write_review '{status:"unavailable", reason:"reviewer output was not valid review JSON"}'
       fi
-    else
+    }
+    review_pending() { [ "$(jq -r .status "$DIR/review.json" 2>/dev/null)" = pending ]; }
+    cancel_review() {
+      [ -n "$REVIEW_PID" ] || return 0
+      if kill -0 "$REVIEW_PID" 2>/dev/null; then
+        pkill -TERM -P "$REVIEW_PID" 2>/dev/null
+        kill "$REVIEW_PID" 2>/dev/null
+        wait "$REVIEW_PID" 2>/dev/null
+      fi
+      REVIEW_PID=""
+      if review_pending; then
+        write_review '{status:"unavailable", reason:"decided before the review finished"}'
+      fi
+    }
+    if [ "$DECRYPT_ONLY" = 1 ]; then
       write_review '{status:"disabled"}'
+    elif [ ${if reviewerEnabled then "1" else "0"} = 0 ]; then
+      write_review '{status:"disabled"}'
+    elif [ "$ORIGIN" = root ] && [ "$REQUESTER" = ${lib.escapeShellArg (toString cfg.humanUser)} ]; then
+      write_review '{status:"skipped", reason:"requested by the human"}'
+    else
+      write_review '{status:"pending"}'
+      run_review &
+      REVIEW_PID=$!
+      # Give the review a head start before asking; the prompter shows
+      # "pending" and updates if it lands later.
+      waited=0
+      while review_pending && [ $waited -lt ${toString (acfg.reviewer.promptDelay * 10)} ]; do
+        sleep 0.1; waited=$((waited + 1))
+      done
     fi
 
     # ── Ask the human ────────────────────────────────────────────
@@ -413,13 +499,18 @@ ${agentCase}
 
     case "$RESPONSE" in
       APPROVED|DECRYPTED) DECISION=approved ;;
-      DENIED) DECISION=denied; echo "Request denied." >&2; RC=1; exit 1 ;;
+      DENIED|DENIED:*)
+        DECISION=denied REASON=''${RESPONSE#DENIED}; REASON=''${REASON#:}
+        echo "Request denied." >&2
+        [ -n "$REASON" ] && printf 'Reason: %s\n' "$REASON" >&2
+        RC=1; exit 1 ;;
       *) DECISION=error; echo "Error communicating with approval broker (got: '$RESPONSE')" >&2; RC=1; exit 1 ;;
     esac
 
     if [ "$DECRYPT_ONLY" = 1 ]; then
       RC=0; exit 0
     fi
+    cancel_review
 
     # ── Run ──────────────────────────────────────────────────────
     SUDO_ARGS=()
@@ -431,7 +522,7 @@ ${agentCase}
     if [ "$LOGIN$SHELLMODE" != 00 ]; then
       CMD=("''${EXEC_ARGV[@]}")
     else
-      CMD=(${runIn} "$CWD" "''${EXEC_ARGV[@]}")
+      CMD=(${runIn} "$CWD" "$DIR" "''${EXEC_ARGV[@]}")
     fi
     # Handlers (not ignore) so the command still gets default signal
     # dispositions, and we survive ^C to write the audit record.
@@ -467,8 +558,61 @@ in
       timeout = lib.mkOption {
         type = lib.types.ints.positive;
         default = 45;
-        description = "Seconds to wait for the review; after that the human is asked with \"review unavailable\".";
+        description = "Seconds the review may take; after that it is recorded as unavailable.";
       };
+      promptDelay = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 15;
+        description = ''
+          Seconds to wait for the review before asking the human anyway.
+          The prompter then shows "review pending" and updates when the
+          review lands (or times out). Never approves by itself.
+        '';
+      };
+    };
+
+    promptTimeout = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 120;
+      description = "Seconds the built-in prompter waits for an answer before denying (0 = no limit). Kinds set their own.";
+    };
+
+    kinds = lib.mkOption {
+      default = {};
+      description = ''
+        Request kinds: a richer request for one command (e.g. a system
+        switch with diffs attached). Matched against the resolved command
+        path; the kind name is in request.json.kind.
+      '';
+      type = lib.types.attrsOf (lib.types.submodule {
+        options = {
+          command = lib.mkOption {
+            type = lib.types.str;
+            description = "Absolute command path as requested (after PATH resolution, not realpath).";
+          };
+          collect = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = ''
+              Collector run as root (a logged sudo call) with the request
+              directory as its argument, before the review. It writes files
+              into <dir>/kind/ for the reviewer and the prompter; its stderr
+              goes to the requester. Non-zero refuses the request with
+              that exit code and no dialog.
+            '';
+          };
+          reviewPrompt = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = "Prompt file the built-in reviewer uses instead of the default one.";
+          };
+          timeout = lib.mkOption {
+            type = lib.types.ints.unsigned;
+            default = 120;
+            description = "Seconds the prompter waits for an answer (0 = until answered or the requester exits).";
+          };
+        };
+      });
     };
 
     audit = {

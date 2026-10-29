@@ -6,12 +6,6 @@ let
 
   socketPath = "/run/nuketown-broker/socket";
 
-  escapeHtml = ''
-    escape_html() {
-      printf "%s\n" "$1" | ${pkgs.gnused}/bin/sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
-    }
-  '';
-
   runDir = "/run/nuketown-approval";
 
   # Renders a request directory (written by nuketown-approve, see
@@ -24,9 +18,12 @@ let
     def bullets: map("\n  • " + (cut(300) | esc)) | join("");
     ($req[0]) as $r
     | (($rev[0]) // {status: "missing"}) as $v
-    | "Agent <b>\($r.requester | esc)</b> wants to run as <b>\($r.run_as.user | esc)</b>:\n\n"
+    | (if $r.origin == "root"
+       then "<b>\($r.requester | esc)</b> (via root) asks to run as <b>\($r.run_as.user | esc)</b>:\n\n"
+       else "Agent <b>\($r.requester | esc)</b> wants to run as <b>\($r.run_as.user | esc)</b>:\n\n" end)
       + "<tt>\($r.display | cut(800) | esc)</tt>"
-      + (if $r.why != "" then "\n\n<b>Agent's stated reason:</b> <i>\($r.why | cut(400) | esc)</i>" else "" end)
+      + (if $r.kind != null then "\n\n<b>Kind:</b> \($r.kind.name | esc)" else "" end)
+      + (if $r.why != "" then "\n\n<b>\(if $r.origin == "root" then "Stated" else "Agent's stated" end) reason:</b> <i>\($r.why | cut(400) | esc)</i>" else "" end)
       + (if ($r.snapshots | length) > 0
          then "\n\n<b>Files</b> (snapshotted; the snapshot is what runs): "
               + ([$r.snapshots[] | (.path | esc) + (if .executed then " (runs)" else "" end)] | join(", "))
@@ -37,59 +34,133 @@ let
            + ($v.summary | cut(1500) | esc)
            + (if ($v.notes | length) > 0 then "\n<b>Concerns:</b>" + ($v.notes | bullets) else "" end)
            + (if ($v.not_shown | length) > 0 then "\n<b>Could not verify:</b>" + ($v.not_shown | bullets) else "" end)
+         elif $v.status == "pending" then "<i>Reviewer is still reading this request; the dialog will update when it's done.</i>"
          elif $v.status == "disabled" then "<i>No reviewer configured.</i>"
+         elif $v.status == "skipped" then "<i>Not reviewed: \(($v.reason // "skipped") | esc).</i>"
          else "<b>No review</b>: " + (($v.reason // $v.status) | esc)
          end)
   '';
 
   # Default prompter: zenity, with a "Show files" button when the request
-  # has snapshots. Exit 0 = approve.
+  # has snapshots or kind files and a "Deny with reason" button. Exit 0 =
+  # approve; on deny, stdout is the reason (may be empty). While the
+  # review is pending the dialog is re-shown as soon as it lands.
+  # NUKETOWN_PROMPT_NOTE (from the broker) is appended to the text.
   zenityPrompter = pkgs.writeShellScript "nuketown-zenity-prompter" ''
     set -uo pipefail
+    export PATH=${lib.makeBinPath (with pkgs; [ coreutils jq zenity ])}
     DIR=$1
-    TEXT=$(${pkgs.jq}/bin/jq -rn --slurpfile req "$DIR/request.json" \
-      --slurpfile rev <(cat "$DIR/review.json" 2>/dev/null || true) \
-      -f ${renderRequest}) || exit 1
-    FILES=$(${pkgs.coreutils}/bin/mktemp)
-    trap '${pkgs.coreutils}/bin/rm -f "$FILES"' EXIT
-    NSNAP=0
+    ZPID=""
+    FILES=$(mktemp) OUT=$(mktemp)
+    trap 'rm -f "$FILES" "$OUT"' EXIT
+    trap '[ -n "$ZPID" ] && kill "$ZPID" 2>/dev/null; exit 1' TERM INT
+
+    review_status() { jq -r '.status // "missing"' "$DIR/review.json" 2>/dev/null || echo missing; }
+
+    NFILES=0
     while IFS= read -r -d "" path && IFS= read -r -d "" snap && IFS= read -r -d "" sha; do
       [[ "$snap" == snapshots/* && "$snap" != *..* ]] || continue
-      NSNAP=$((NSNAP + 1))
+      NFILES=$((NFILES + 1))
       printf '==== %s\n==== sha256 %s\n\n' "$path" "$sha" >> "$FILES"
-      ${pkgs.coreutils}/bin/head -c 1048576 "$DIR/$snap" >> "$FILES"
+      head -c 1048576 "$DIR/$snap" >> "$FILES"
       printf '\n\n' >> "$FILES"
-    done < <(${pkgs.jq}/bin/jq -j '.snapshots[] | .path, "\u0000", .snapshot, "\u0000", .sha256, "\u0000"' "$DIR/request.json")
-    EXTRA=()
-    [ "$NSNAP" -gt 0 ] && EXTRA=(--extra-button "Show files")
+    done < <(jq -j '.snapshots[] | .path, "\u0000", .snapshot, "\u0000", .sha256, "\u0000"' "$DIR/request.json")
+    if [ -d "$DIR/kind" ]; then
+      for f in "$DIR"/kind/*; do
+        [ -f "$f" ] || continue
+        NFILES=$((NFILES + 1))
+        printf '==== %s\n\n' "''${f#"$DIR"/}" >> "$FILES"
+        head -c 1048576 "$f" >> "$FILES"
+        printf '\n\n' >> "$FILES"
+      done
+    fi
+
+    EXTRA=(--extra-button "Deny with reason")
+    [ "$NFILES" -gt 0 ] && EXTRA+=(--extra-button "Show files")
+    TIMEOUT=$(jq -r '.prompt_timeout // 120' "$DIR/request.json")
+    [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || TIMEOUT=120
+    DEADLINE=$(( $(date +%s) + TIMEOUT ))
+
     while true; do
-      OUT=$(${pkgs.zenity}/bin/zenity --question \
-        --title="Nuketown: Sudo Approval" \
-        --text="$TEXT" \
-        --ok-label="Approve" --cancel-label="Deny" --default-cancel \
-        --width=640 --timeout=120 "''${EXTRA[@]}" 2>/dev/null)
-      RC=$?
-      [ $RC -eq 0 ] && exit 0
-      if [ "$OUT" = "Show files" ]; then
-        ${pkgs.zenity}/bin/zenity --text-info --title="Nuketown: files in this request" \
-          --filename="$FILES" --width=900 --height=700 2>/dev/null
-        continue
+      TEXT=$(jq -rn --slurpfile req "$DIR/request.json" \
+        --slurpfile rev <(cat "$DIR/review.json" 2>/dev/null || true) \
+        -f ${renderRequest}) || exit 1
+      [ -n "''${NUKETOWN_PROMPT_NOTE-}" ] && TEXT+="\n\n$NUKETOWN_PROMPT_NOTE"
+      TOPT=()
+      if [ "$TIMEOUT" -gt 0 ]; then
+        left=$(( DEADLINE - $(date +%s) ))
+        if [ "$left" -le 0 ]; then echo "no answer within ''${TIMEOUT}s"; exit 1; fi
+        TOPT=(--timeout="$left")
       fi
+      shown=$(review_status)
+      zenity --question --title="Nuketown: Sudo Approval" --text="$TEXT" \
+        --ok-label="Approve" --cancel-label="Deny" --default-cancel \
+        --width=640 "''${TOPT[@]}" "''${EXTRA[@]}" > "$OUT" 2>/dev/null &
+      ZPID=$!
+      replaced=0
+      while kill -0 "$ZPID" 2>/dev/null; do
+        if [ "$shown" = pending ] && [ "$(review_status)" != pending ]; then
+          kill "$ZPID" 2>/dev/null; replaced=1; break
+        fi
+        sleep 0.3
+      done
+      wait "$ZPID"; RC=$?; ZPID=""
+      [ "$replaced" = 1 ] && continue
+      [ $RC -eq 0 ] && exit 0
+      case "$(cat "$OUT")" in
+        "Show files")
+          zenity --text-info --title="Nuketown: files in this request" \
+            --filename="$FILES" --width=900 --height=700 2>/dev/null
+          continue ;;
+        "Deny with reason")
+          zenity --entry --title="Nuketown: deny" --text="Reason (shown to the requester):" \
+            --width=500 2>/dev/null | head -c 500
+          exit 1 ;;
+      esac
+      [ $RC -eq 5 ] && echo "no answer within ''${TIMEOUT}s"
       exit 1
     done
   '';
 
   prompter = if cfg.prompter != null then cfg.prompter else "${zenityPrompter}";
 
+  # Asks about a decrypt with no command (sops-unlock). Exit 0 = go ahead.
+  decryptPrompter = pkgs.writeShellScript "nuketown-decrypt-prompter" ''
+    set -uo pipefail
+    SRC=$(printf '%s' "$1" | ${pkgs.gnused}/bin/sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+    ZPID=""
+    trap '[ -n "$ZPID" ] && kill "$ZPID" 2>/dev/null; exit 1' TERM INT
+    ${pkgs.zenity}/bin/zenity --question --title="Nuketown: Decrypt" \
+      --text="Decrypt with your GPG key:\n\n<tt>$SRC</tt>''${NUKETOWN_PROMPT_NOTE:+\n\n$NUKETOWN_PROMPT_NOTE}" \
+      --ok-label="Unlock" --cancel-label="Deny" --default-cancel \
+      --width=500 --timeout=120 2>/dev/null &
+    ZPID=$!
+    wait "$ZPID"
+  '';
+
   # ── Multi-op Broker Handler ─────────────────────────────────
   # Reads all ops from a connection, then decides how to fulfill them.
   # Only the nuketown-approval service user can connect (socket group).
   #   REQUEST:<id>            a sudo request; details in ${runDir}/<id>
   #   DECRYPT:<src>:<dest>    decrypt with the human's GPG key (YubiKey)
-  # DECRYPT + REQUEST = combined flow: one popup, one YubiKey touch.
+  # Replies APPROVED / DECRYPTED, or DENIED[:<reason>] (one line).
+  #
+  # Decrypts never start gpg's PIN prompt while a dialog is up (it would
+  # open behind the dialog and grab the keyboard): the dialog comes first
+  # and gpg runs after Approve. With touchApproves, gpg is also tried in
+  # parallel with --pinentry-mode error, so when the key is already
+  # unlocked a YubiKey touch alone approves; if a PIN is needed that
+  # attempt fails at once and the PIN is asked after Approve.
   brokerHandler = pkgs.writeShellScript "nuketown-broker-handler" ''
     set -uo pipefail
-    ${escapeHtml}
+    export PATH=${lib.makeBinPath (with pkgs; [ coreutils gnupg zenity gnused ])}:$PATH
+
+    deny() {   # deny [reason]
+      local r
+      r=$(printf '%s' "''${1-}" | tr -d '\000-\037' | head -c 500)
+      if [ -n "$r" ]; then echo "DENIED:$r"; else echo "DENIED"; fi
+      exit 0
+    }
 
     # ── Read all ops from the connection ──────────────────────
     DECRYPT_SRC=""
@@ -97,12 +168,10 @@ let
     REQ_ID=""
 
     while IFS= read -r REQUEST && [ -n "$REQUEST" ]; do
-      OP=$(echo "$REQUEST" | ${pkgs.coreutils}/bin/cut -d: -f1)
-
-      case "$OP" in
+      case "''${REQUEST%%:*}" in
         DECRYPT)
-          DECRYPT_SRC=$(echo "$REQUEST" | ${pkgs.coreutils}/bin/cut -d: -f2)
-          DECRYPT_DEST=$(echo "$REQUEST" | ${pkgs.coreutils}/bin/cut -d: -f3)
+          DECRYPT_SRC=$(printf '%s' "$REQUEST" | cut -d: -f2)
+          DECRYPT_DEST=$(printf '%s' "$REQUEST" | cut -d: -f3)
           ;;
         REQUEST)
           REQ_ID=''${REQUEST#REQUEST:}
@@ -119,209 +188,75 @@ let
     done
     REQ_DIR="${runDir}/$REQ_ID"
 
-    # ── Decide how to handle the request set ──────────────────
-
-    # Custom prompter: ask first, then decrypt (one YubiKey touch).
-    if [ -n "$REQ_ID" ] && [ ${if cfg.prompter != null then "1" else "0"} = 1 ]; then
-      if ! ${prompter} "$REQ_DIR" < /dev/null > /dev/null 2>&1; then
-        echo "DENIED"
-        exit 0
-      fi
-      if [ -n "$DECRYPT_SRC" ]; then
-        TMPFILE=$(${pkgs.coreutils}/bin/mktemp)
-        trap 'rm -f "$TMPFILE"' EXIT
-        if ! ${pkgs.gnupg}/bin/gpg -d "$DECRYPT_SRC" > "$TMPFILE" 2>/dev/null; then
-          echo "DENIED"
-          exit 0
-        fi
-        ${pkgs.coreutils}/bin/install -m 600 "$TMPFILE" "$DECRYPT_DEST"
-      fi
-      echo "APPROVED"
-      exit 0
-    fi
-
-    # Combined: DECRYPT + REQUEST = one popup with command context, one YubiKey touch
-    if [ -n "$DECRYPT_SRC" ] && [ -n "$REQ_ID" ]; then
-      REQ_TEXT=$(${pkgs.jq}/bin/jq -rn --slurpfile req "$REQ_DIR/request.json" \
-        --slurpfile rev <(cat "$REQ_DIR/review.json" 2>/dev/null || true) \
-        -f ${renderRequest}) || { echo "ERROR: bad request"; exit 0; }
-
-      TMPFILE=$(${pkgs.coreutils}/bin/mktemp)
-      cleanup() {
-        rm -f "$TMPFILE" 2>/dev/null || true
-      }
-      trap cleanup EXIT
-
-      # Start gpg in background (blocks on YubiKey touch)
-      ${pkgs.gnupg}/bin/gpg -d "$DECRYPT_SRC" > "$TMPFILE" 2>/dev/null &
-      GPG_PID=$!
-
-      # Single popup showing exactly what will happen
-      ${pkgs.zenity}/bin/zenity \
-          --question \
-          --title="Nuketown: Approval" \
-          --text="$REQ_TEXT\n\nThis requires unlocking secrets.\nTouch YubiKey to approve, or click Deny." \
-          --ok-label="Approve" \
-          --cancel-label="Deny" \
-          --default-cancel \
-          --width=640 \
-          2>/dev/null &
-      ZENITY_PID=$!
-
-      GPG_DONE=""
-      GPG_OK=""
-
-      while true; do
-        # Check if gpg finished
-        if [ -z "$GPG_DONE" ] && ! kill -0 "$GPG_PID" 2>/dev/null; then
-          wait "$GPG_PID" 2>/dev/null
-          GPG_RC=$?
-          GPG_DONE=1
-          [ "$GPG_RC" -eq 0 ] && GPG_OK=1
-
-          if [ -n "$GPG_OK" ]; then
-            # YubiKey touched — approve everything
-            kill "$ZENITY_PID" 2>/dev/null || true
-            wait "$ZENITY_PID" 2>/dev/null || true
-            ${pkgs.coreutils}/bin/install -m 600 "$TMPFILE" "$DECRYPT_DEST"
-            echo "APPROVED"
-            exit 0
-          fi
-        fi
-
-        # Check if zenity finished
-        if ! kill -0 "$ZENITY_PID" 2>/dev/null; then
-          wait "$ZENITY_PID" 2>/dev/null
-          ZENITY_RC=$?
-
-          if [ "$ZENITY_RC" -eq 0 ]; then
-            # Approve clicked
-            if [ -z "$GPG_DONE" ]; then
-              # GPG still running — wait for YubiKey touch
-              wait "$GPG_PID" 2>/dev/null
-              GPG_RC=$?
-              GPG_DONE=1
-              [ "$GPG_RC" -eq 0 ] && GPG_OK=1
-            fi
-
-            if [ -n "$GPG_OK" ]; then
-              ${pkgs.coreutils}/bin/install -m 600 "$TMPFILE" "$DECRYPT_DEST"
-              echo "APPROVED"
-              exit 0
-            fi
-
-            # GPG failed (YubiKey timed out) — retry loop
-            while true; do
-              ${pkgs.gnupg}/bin/gpg -d "$DECRYPT_SRC" > "$TMPFILE" 2>/dev/null &
-              GPG_PID=$!
-
-              ${pkgs.zenity}/bin/zenity \
-                  --question \
-                  --title="Nuketown: Retry" \
-                  --text="YubiKey timed out.\\n\\nTouch YubiKey to retry, or click Deny to abort." \
-                  --ok-label="Retry" \
-                  --cancel-label="Deny" \
-                  --default-cancel \
-                  --width=400 \
-                  2>/dev/null &
-              RETRY_PID=$!
-
-              while true; do
-                if ! kill -0 "$GPG_PID" 2>/dev/null; then
-                  wait "$GPG_PID" 2>/dev/null
-                  GPG_RC=$?
-                  if [ "$GPG_RC" -eq 0 ]; then
-                    kill "$RETRY_PID" 2>/dev/null || true
-                    wait "$RETRY_PID" 2>/dev/null || true
-                    ${pkgs.coreutils}/bin/install -m 600 "$TMPFILE" "$DECRYPT_DEST"
-                    echo "APPROVED"
-                    exit 0
-                  fi
-                  # GPG failed again — break inner loop, will show retry dialog again or exit
-                  kill "$RETRY_PID" 2>/dev/null || true
-                  wait "$RETRY_PID" 2>/dev/null || true
-                  break
-                fi
-
-                if ! kill -0 "$RETRY_PID" 2>/dev/null; then
-                  wait "$RETRY_PID" 2>/dev/null
-                  RETRY_RC=$?
-                  if [ "$RETRY_RC" -eq 0 ]; then
-                    # Retry clicked — wait for current GPG attempt
-                    wait "$GPG_PID" 2>/dev/null
-                    GPG_RC=$?
-                    if [ "$GPG_RC" -eq 0 ]; then
-                      ${pkgs.coreutils}/bin/install -m 600 "$TMPFILE" "$DECRYPT_DEST"
-                      echo "APPROVED"
-                      exit 0
-                    fi
-                    break  # GPG failed, outer loop retries
-                  else
-                    # Deny clicked
-                    kill "$GPG_PID" 2>/dev/null || true
-                    wait "$GPG_PID" 2>/dev/null || true
-                    echo "DENIED"
-                    exit 0
-                  fi
-                fi
-
-                sleep 0.1
-              done
-            done
-          else
-            # Deny clicked
-            kill "$GPG_PID" 2>/dev/null || true
-            wait "$GPG_PID" 2>/dev/null || true
-            echo "DENIED"
-            exit 0
-          fi
-        fi
-
-        sleep 0.1
-      done
-    fi
-
-    # DECRYPT only (no sudo)
-    if [ -n "$DECRYPT_SRC" ]; then
-      SRC_ESC=$(escape_html "$DECRYPT_SRC")
-
-      TMPFILE=$(${pkgs.coreutils}/bin/mktemp)
-      cleanup() { rm -f "$TMPFILE" 2>/dev/null || true; }
-      trap cleanup EXIT
-
-      ${pkgs.zenity}/bin/zenity \
-          --info \
-          --title="Nuketown: Decrypt" \
-          --text="Touch YubiKey to decrypt:\n\n<tt>$SRC_ESC</tt>" \
-          --ok-label="Cancel" \
-          --width=400 \
-          2>/dev/null &
-      ZENITY_PID=$!
-
-      if ${pkgs.gnupg}/bin/gpg -d "$DECRYPT_SRC" > "$TMPFILE" 2>/dev/null; then
-        kill $ZENITY_PID 2>/dev/null || true
-        wait $ZENITY_PID 2>/dev/null || true
-        ${pkgs.coreutils}/bin/install -m 600 "$TMPFILE" "$DECRYPT_DEST"
-        echo "DECRYPTED"
-      else
-        kill $ZENITY_PID 2>/dev/null || true
-        wait $ZENITY_PID 2>/dev/null || true
-        echo "DENIED"
-      fi
-      exit 0
-    fi
-
-    # REQUEST only (no decrypt)
     if [ -n "$REQ_ID" ]; then
-      if ${prompter} "$REQ_DIR" < /dev/null > /dev/null 2>&1; then
-        echo "APPROVED"
-      else
-        echo "DENIED"
-      fi
+      ASK=(${prompter} "$REQ_DIR")
+    elif [ -n "$DECRYPT_SRC" ]; then
+      ASK=(${decryptPrompter} "$DECRYPT_SRC")
+    else
+      echo "ERROR: no valid operations"
       exit 0
     fi
 
-    echo "ERROR: no valid operations"
+    TMP=$(mktemp -d)
+    PPID_=""; GPID=""
+    cleanup() {
+      [ -n "$PPID_" ] && kill "$PPID_" 2>/dev/null
+      [ -n "$GPID" ] && kill "$GPID" 2>/dev/null
+      rm -rf "$TMP"
+    }
+    trap cleanup EXIT
+
+    finish_decrypt() {
+      install -m 600 "$TMP/plain" "$DECRYPT_DEST" || deny "could not write $DECRYPT_DEST"
+      if [ -n "$REQ_ID" ]; then echo "APPROVED"; else echo "DECRYPTED"; fi
+      exit 0
+    }
+
+    # ── Ask (with an optional touch-only decrypt racing it) ──
+    if [ -n "$DECRYPT_SRC" ]; then
+      export NUKETOWN_PROMPT_NOTE="This also unlocks secrets with your GPG key. ${
+        if cfg.touchApproves
+        then "If the key is already unlocked, touching it approves; otherwise click Approve, then enter your PIN."
+        else "Click Approve, then enter your PIN / touch the key."}"
+    fi
+    "''${ASK[@]}" < /dev/null > "$TMP/reason" 2>/dev/null &
+    PPID_=$!
+    ${lib.optionalString cfg.touchApproves ''
+      if [ -n "$DECRYPT_SRC" ]; then
+        gpg --batch --pinentry-mode error -d "$DECRYPT_SRC" > "$TMP/plain" 2>/dev/null &
+        GPID=$!
+      fi
+    ''}
+    while kill -0 "$PPID_" 2>/dev/null; do
+      if [ -n "$GPID" ] && ! kill -0 "$GPID" 2>/dev/null; then
+        if wait "$GPID"; then
+          # Touched while the dialog was up: approve everything.
+          GPID=""; kill "$PPID_" 2>/dev/null; wait "$PPID_" 2>/dev/null; PPID_=""
+          finish_decrypt
+        fi
+        GPID=""   # needs a PIN (or no touch): ask after Approve
+      fi
+      sleep 0.1
+    done
+    wait "$PPID_"; RC=$?; PPID_=""
+    if [ $RC -ne 0 ]; then
+      deny "$(head -n1 "$TMP/reason" 2>/dev/null)"
+    fi
+    [ -z "$DECRYPT_SRC" ] && { echo "APPROVED"; exit 0; }
+
+    # ── Approved; decrypt now (the dialog is gone, so a PIN prompt is visible)
+    if [ -n "$GPID" ]; then
+      # The touch-only attempt is still waiting for a touch.
+      if wait "$GPID"; then GPID=""; finish_decrypt; fi
+      GPID=""
+    fi
+    while true; do
+      gpg -d "$DECRYPT_SRC" > "$TMP/plain" 2>/dev/null && finish_decrypt
+      zenity --question --title="Nuketown: Retry" \
+        --text="Decrypting with your GPG key failed (wrong PIN, no touch, or no key).\n\nRetry?" \
+        --ok-label="Retry" --cancel-label="Deny" --default-cancel --width=400 2>/dev/null \
+        || deny "decrypt failed"
+    done
   '';
 
   # ── XMPP Broker Client ──────────────────────────────────────
@@ -538,8 +473,29 @@ in
         Command that asks the human about a sudo request. It gets the
         request directory (request.json, review.json, snapshots/) as its
         only argument and exits 0 to approve, anything else to deny.
-        null uses the built-in zenity dialog. With a custom prompter, a
-        decrypt (sudoex --decrypt) runs after approval.
+        null uses the built-in zenity dialog.
+
+        On deny, the first line of stdout is the reason shown to the
+        requester. review.json may be {"status":"pending"} when the
+        prompter starts and is replaced (atomically) when the review
+        lands; re-read it to update. The broker may send SIGTERM (a
+        YubiKey touch approved a decrypt, see touchApproves). For a
+        decrypt, NUKETOWN_PROMPT_NOTE carries a line to show. gpg's PIN
+        prompt only appears after the prompter has exited 0.
+      '';
+    };
+
+    touchApproves = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        For requests that also decrypt (sudoex --decrypt, sops-unlock),
+        try the decrypt alongside the dialog without a PIN prompt
+        (gpg --pinentry-mode error), so that when the key is already
+        unlocked a YubiKey touch alone approves. Only safe when the key
+        requires a touch to decrypt: with a software key or a cached
+        passphrase that parallel decrypt succeeds with no human action
+        and approves the request by itself. Set false for those.
       '';
     };
 

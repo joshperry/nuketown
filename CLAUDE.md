@@ -66,7 +66,8 @@ nuketown/
 │   ├── sudo-approval-mock.sh  # Mock approval test suite
 │   ├── approval-node.nix      # Shared VM node for the approval NixOS tests
 │   ├── sudo-approval-bypass.nix  # VM check: no path to root without approval
-│   └── approval-flow.nix      # VM check: snapshots, reviewer, decrypt, audit
+│   ├── approval-flow.nix      # VM check: snapshots, reviewer, kinds, requester, audit
+│   └── approval-decrypt.nix   # VM check: PIN prompt after Approve, touch-only approval
 ├── README.md             # User-facing documentation
 ├── CLAUDE.md             # This file - developer guidance
 └── docs/testing.md       # Testing session notes
@@ -140,14 +141,22 @@ When `sudo.enable = true` for an agent:
 2. `nuketown-approve` (approval.nix) runs as the unprivileged `nuketown-approval`
    service user. It writes `/run/nuketown-approval/<id>/request.json`, snapshots
    any script that will run (reading it *as the agent*, via sudo) and rewrites
-   argv to run the snapshot, and optionally runs the reviewer agent
-   (`nuketown.approval.reviewer`) for a plain-English analysis.
+   argv to run the snapshot. If the command is a request kind
+   (`nuketown.approval.kinds`), its collector runs as root and writes `kind/`.
+   The reviewer agent (`nuketown.approval.reviewer`) starts in the background;
+   after `promptDelay` the human is asked anyway and `review.json` goes from
+   `pending` to the review when it lands. Root may pass `--requester <name>`
+   (human or timer requests; the human's own requests skip the review).
 3. It sends `REQUEST:<id>` to the human's broker (approval-daemon.nix), the only
    other member of the broker socket's group. The broker shows the request
-   (zenity by default, or `nuketown.approvalDaemon.prompter`).
+   (zenity by default, or `nuketown.approvalDaemon.prompter`) and answers
+   `APPROVED` or `DENIED[:reason]`; the reason is printed to the agent. For a
+   decrypt, gpg's PIN prompt only appears after Approve; with
+   `approvalDaemon.touchApproves` a touch-only decrypt races the dialog.
 4. On approval the service user runs the command with sudo, passing stdio and the
-   exit code through, and writes a journal record (`-t nuketown-approval`) and an
-   audit copy under `nuketown.approval.audit.dir`.
+   exit code through (`NUKETOWN_APPROVAL_DIR` points at the request), and writes
+   a journal record (`-t nuketown-approval`) and an audit copy under
+   `nuketown.approval.audit.dir`.
 
 The service user is root-equivalent by design; the point is that every
 privileged step it takes is a logged sudo call and root never parses requests.

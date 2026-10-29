@@ -230,6 +230,7 @@ ${agentCase}
     chmod 0755 "$DIR/snapshots"
     DECISION="error" PROMPTER="none" RC=1 EXEC_ARGV=() SNAPS="[]" REASON=""
     KIND="" KIND_COLLECT="" KIND_PROMPT="" PROMPT_TIMEOUT=${toString acfg.promptTimeout}
+    SKIP_REVIEW=""   # the collector's kind/skip-review reason, if it wrote one
     REVIEW_PID=""
     cancel_review() { :; }   # replaced once a review can be running
 
@@ -243,11 +244,13 @@ ${agentCase}
         --argjson exec_argv "$(json_array "''${EXEC_ARGV[@]}")" \
         --argjson snapshots "$SNAPS" --argjson review "$review" \
         --arg decision "$DECISION" --arg prompter "$PROMPTER" --argjson exit "$RC" \
-        --arg origin "$ORIGIN" --arg kind "$KIND" --arg reason "$REASON" \
+        --arg origin "$ORIGIN" --arg kind "$KIND" --arg reason "$REASON" --arg skip "$SKIP_REVIEW" \
         '{id:$id, requester:$requester, origin:$origin, kind:(if $kind == "" then null else $kind end),
           argv:$argv, exec_argv:$exec_argv,
           snapshots:[$snapshots[] | {path, sha256}],
-          review:{status:$review.status, risk:$review.risk, recommendation:$review.recommendation},
+          review:{status:$review.status, risk:$review.risk, recommendation:$review.recommendation,
+                  by:$review.by, reason:$review.reason},
+          skip_review:(if $skip == "" then null else $skip end),
           decision:$decision, reason:(if $reason == "" then null else $reason end),
           prompter:$prompter, exit:$exit}')
       printf '%s\n' "$rec" | systemd-cat -t nuketown-approval || true
@@ -413,6 +416,17 @@ ${kindCase}
         DECISION=refused REASON="$KIND collector refused (exit $rc)"
         RC=$rc; exit $rc
       fi
+      # kind/skip-review: the collector says the review adds nothing here
+      # (an undo, a rollback to a known generation, a signed release). Its
+      # first line is the reason shown on the dialog. Only this file counts:
+      # kind/ is made here by the service user and only root (the
+      # collector) writes into it; nothing the requester passes (argv,
+      # --why, env, snapshots) reaches it. A symlink or non-file is ignored.
+      sk="$DIR/kind/skip-review"
+      if [ -f "$sk" ] && [ ! -L "$sk" ]; then
+        SKIP_REVIEW=$(head -c 4096 "$sk" | head -n 1 | tr -d '\000-\037\177' | cut -c 1-300)
+        SKIP_REVIEW=''${SKIP_REVIEW:-$KIND collector says no review is needed}
+      fi
     fi
 
     # ── Review (in the background; the ask may start before it lands) ──
@@ -460,6 +474,9 @@ ${kindCase}
     }
     if [ "$DECRYPT_ONLY" = 1 ]; then
       write_review '{status:"disabled"}'
+    elif [ -n "$SKIP_REVIEW" ]; then
+      # No reviewer run and no promptDelay: ask right away.
+      write_review --arg r "$SKIP_REVIEW" '{status:"skipped", by:"collector", reason:$r}'
     elif [ ${if reviewerEnabled then "1" else "0"} = 0 ]; then
       write_review '{status:"disabled"}'
     elif [ "$ORIGIN" = root ] && [ "$REQUESTER" = ${lib.escapeShellArg (toString cfg.humanUser)} ]; then
@@ -599,6 +616,15 @@ in
               into <dir>/kind/ for the reviewer and the prompter; its stderr
               goes to the requester. Non-zero refuses the request with
               that exit code and no dialog.
+
+              If it writes <dir>/kind/skip-review (a regular file), the
+              reviewer is not run and the human is asked at once; the
+              file's first line is the reason ("rollback to generation
+              41"), shown on the dialog as "No review: <reason>" and
+              recorded in review.json ({status:"skipped", by:"collector"}),
+              the journal record (skip_review) and the audit copy. Only
+              the collector can write it; requests without a kind are
+              always reviewed.
             '';
           };
           reviewPrompt = lib.mkOption {

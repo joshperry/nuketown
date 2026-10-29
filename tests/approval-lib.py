@@ -11,6 +11,7 @@ def setup():
         "mkdir -p /tmp/prompts && chmod 1777 /tmp/prompts",
         "echo deny > /tmp/prompter-answer && chmod 644 /tmp/prompter-answer",
         "echo ok > /tmp/reviewer-mode && chmod 644 /tmp/reviewer-mode",
+        "touch /tmp/reviewer-log && chmod 666 /tmp/reviewer-log",
     )
 
 
@@ -60,3 +61,7 @@ def start_bg(user, cmd):
 def wait_bg():
     machine.wait_until_succeeds("test -s /tmp/bg.rc", timeout=90)
     return int(machine.succeed("cat /tmp/bg.rc").strip()), machine.succeed("cat /tmp/bg.out")
+
+
+def reviewer_saw(req_id):
+    return req_id in machine.succeed("cat /tmp/reviewer-log").split()

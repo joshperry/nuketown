@@ -6,20 +6,26 @@
 #   /tmp/prompter-answer (approve|deny), denying with the reason in
 #   /tmp/prompter-reason if present. If /tmp/prompter-wait exists it
 #   waits for /tmp/prompter-go before answering. review.json as it was
-#   when answering is kept as review-at-answer.json.
+#   when answering is kept as review-at-answer.json, and the built-in
+#   renderer's dialog text for it as text.txt.
 # - reviewer runs a stub review command whose behaviour comes from
-#   /tmp/reviewer-mode (ok|slow|hang|garbage|fail). The prompt is shown
-#   after promptDelay (2 s) even while the review is still running.
+#   /tmp/reviewer-mode (ok|slow|hang|garbage|fail) and appends the
+#   request id to /tmp/reviewer-log. The prompt is shown after
+#   promptDelay (2 s) even while the review is still running.
 # - kind "demo" for kind-cmd: its collector writes kind/diff.txt, or
 #   refuses (exit 5) when /tmp/collect-refuse exists.
+# - kind "undo" for undo-cmd: its collector writes kind/skip-review
+#   ("rollback to generation 41"), so no reviewer runs.
 # - ada (any command) and eve (approvalAllow = [ "id" ]) can sudo;
 #   bob is a plain user to test `sudo -u`.
 
 { nuketownModule, home-manager, impermanence, sops-nix, nixpkgs-unstable, touchApproves ? false }:
 
-{ pkgs, ... }:
+{ pkgs, config, ... }:
 
 let
+  renderer = config.home-manager.users.human.nuketown.approvalDaemon.renderer;
+
   prompter = pkgs.writeShellScript "stub-prompter" ''
     set -u
     n=$(${pkgs.coreutils}/bin/ls /tmp/prompts | ${pkgs.coreutils}/bin/wc -l)
@@ -31,6 +37,8 @@ let
       while [ ! -e /tmp/prompter-go ]; do ${pkgs.coreutils}/bin/sleep 0.2; done
     fi
     ${pkgs.coreutils}/bin/cp "$1/review.json" "$d/review-at-answer.json"
+    ${pkgs.jq}/bin/jq -rn --slurpfile req "$1/request.json" --slurpfile rev "$1/review.json" \
+      -f ${renderer} > "$d/text.txt"
     ${pkgs.coreutils}/bin/date +%s.%N > "$d/answered"
     if [ "$(${pkgs.coreutils}/bin/cat /tmp/prompter-answer)" = approve ]; then exit 0; fi
     ${pkgs.coreutils}/bin/cat /tmp/prompter-reason 2>/dev/null
@@ -51,7 +59,17 @@ let
     echo DIFF > "$1/kind/diff.txt"
   '';
 
+  undoCmd = pkgs.writeShellScriptBin "undo-cmd" ''
+    echo undone
+  '';
+
+  undoCollector = pkgs.writeShellScript "undo-collect" ''
+    echo "rollback to generation 41" > "$1/kind/skip-review"
+    echo "generation 41" > "$1/kind/target.txt"
+  '';
+
   reviewer = pkgs.writeShellScript "stub-reviewer" ''
+    ${pkgs.jq}/bin/jq -r .id "$1/request.json" >> /tmp/reviewer-log
     case "$(${pkgs.coreutils}/bin/cat /tmp/reviewer-mode 2>/dev/null)" in
       ok)
         ${pkgs.jq}/bin/jq -c '{summary: ("runs " + .display), risk: "low",
@@ -86,7 +104,7 @@ in
     nuketown.approvalDaemon = { enable = true; prompter = "${prompter}"; inherit touchApproves; };
   };
 
-  environment.systemPackages = [ pkgs.socat pkgs.gnupg pkgs.jq kindCmd ];
+  environment.systemPackages = [ pkgs.socat pkgs.gnupg pkgs.jq kindCmd undoCmd ];
 
   nuketown = {
     enable = true;
@@ -101,6 +119,10 @@ in
       collect = "${collector}";
       reviewPrompt = "${pkgs.writeText "demo-prompt.md" "demo prompt"}";
       timeout = 0;
+    };
+    approval.kinds.undo = {
+      command = "/run/current-system/sw/bin/undo-cmd";
+      collect = "${undoCollector}";
     };
   };
 }

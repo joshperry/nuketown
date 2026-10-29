@@ -145,7 +145,10 @@ When `sudo.enable = true` for an agent:
    (`nuketown.approval.kinds`), its collector runs as root and writes `kind/`.
    The reviewer agent (`nuketown.approval.reviewer`) starts in the background;
    after `promptDelay` the human is asked anyway and `review.json` goes from
-   `pending` to the review when it lands. Root may pass `--requester <name>`
+   `pending` to the review when it lands. A collector that writes `kind/skip-review`
+   (undo, rollback, signed update) skips the reviewer and the delay; its first
+   line is shown as "No review: <reason>" and recorded as `skip_review`. Only
+   the collector (root, in the service user's `kind/`) can write it. Root may pass `--requester <name>`
    (human or timer requests; the human's own requests skip the review).
 3. It sends `REQUEST:<id>` to the human's broker (approval-daemon.nix), the only
    other member of the broker socket's group. The broker shows the request

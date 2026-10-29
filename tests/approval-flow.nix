@@ -162,6 +162,62 @@ pkgs.testers.runNixOSTest {
         assert rec["decision"] == "refused" and rec["kind"] == "demo", rec
         machine.succeed("rm /tmp/collect-refuse")
 
+    with subtest("approval-kinds: collector's skip-review: no reviewer, reason on the dialog and in the audit"):
+        # A reviewer that hangs: had it been started, the prompt would see "pending".
+        machine.succeed("echo hang > /tmp/reviewer-mode")
+        n0 = prompt_count()
+        out = machine.succeed(as_ada("sudo --why 'undo the last switch' undo-cmd"))
+        assert out.strip() == "undone", out
+        n, req, rev = last_prompt()
+        assert n == n0 + 1 and req["kind"]["name"] == "undo", (n, req)
+        reason = "rollback to generation 41"
+        assert rev == {"status": "skipped", "by": "collector", "reason": reason}, rev
+        assert not reviewer_saw(req["id"]), "reviewer ran for a skip-review request"
+        text = machine.succeed(f"cat /tmp/prompts/{n}/text.txt")
+        assert f"<b>No review:</b> {reason}" in text, text
+        rec = [r for r in journal_records() if r["id"] == req["id"]][-1]
+        assert rec["skip_review"] == reason and rec["decision"] == "approved", rec
+        assert rec["review"]["status"] == "skipped" and rec["review"]["by"] == "collector", rec
+        assert rec["review"]["reason"] == reason, rec
+        audit = f"/var/lib/nuketown-approval/{req['id']}"
+        assert json.loads(machine.succeed(f"cat {audit}/decision.json"))["skip_review"] == reason
+        assert json.loads(machine.succeed(f"cat {audit}/review.json"))["by"] == "collector"
+        assert machine.succeed(f"cat {audit}/kind/skip-review").strip() == reason
+        machine.succeed("echo ok > /tmp/reviewer-mode")
+
+    with subtest("skip-review: the requester cannot plant it"):
+        machine.succeed(as_ada(
+            "mkdir -p ~/kind && echo planted > ~/kind/skip-review && echo planted > ~/skip-review"))
+        # kind/ belongs to the service user and only root writes in it; the
+        # requester can't write in the request dir at all (held prompt).
+        machine.succeed("rm -f /tmp/prompter-go && touch /tmp/prompter-wait")
+        n0 = prompt_count()
+        start_bg("ada", "cd ~ && sudo --why skip-review kind-cmd ./skip-review kind/skip-review")
+        machine.wait_until_succeeds(f"test -e /tmp/prompts/{n0 + 1}/request.json", timeout=60)
+        d = machine.succeed(f"cat /tmp/prompts/{n0 + 1}/dir").strip()
+        assert machine.succeed(f"stat -c '%U %a' {d} {d}/kind").split("\n")[:2] == \
+            ["nuketown-approval 2751", "nuketown-approval 2755"], machine.succeed(f"stat -c '%U %a' {d} {d}/kind")
+        machine.fail(as_ada(f"echo planted > {d}/kind/skip-review"))
+        machine.fail(as_ada(f"echo planted > {d}/skip-review"))
+        machine.fail(as_ada(f"ln -s ~/skip-review {d}/kind/skip-review"))
+        machine.fail(f"test -e {d}/kind/skip-review")
+        machine.succeed("rm /tmp/prompter-wait && touch /tmp/prompter-go")
+        rc, _ = wait_bg()
+        assert rc == 0, rc
+        n = n0 + 1
+        # A plain request with skip-review in argv, --why, snapshots and env.
+        machine.succeed(as_ada(
+            "cd ~ && NUKETOWN_SKIP_REVIEW=1 SKIP_REVIEW=planted sudo --why skip-review cat skip-review kind/skip-review"))
+        for i in [n, n + 1]:
+            req = json.loads(machine.succeed(f"cat /tmp/prompts/{i}/request.json"))
+            assert any(s["snapshot"].endswith("/skip-review") for s in req["snapshots"]), req["snapshots"]
+            rev = json.loads(machine.succeed(f"cat /tmp/prompts/{i}/review-at-answer.json"))
+            assert rev["status"] == "ok", rev
+            assert reviewer_saw(req["id"]), req["id"]
+            rec = [r for r in journal_records() if r["id"] == req["id"]][-1]
+            assert rec["skip_review"] is None and rec["review"]["status"] == "ok", rec
+            assert "No review" not in machine.succeed(f"cat /tmp/prompts/{i}/text.txt")
+
     with subtest("audit: journal record and persisted request dir"):
         machine.execute(as_ada("sudo sh -c 'exit 3'"))
         rec = [r for r in journal_records() if r["argv"] == ["sh", "-c", "exit 3"]][-1]

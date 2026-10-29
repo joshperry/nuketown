@@ -36,6 +36,7 @@ let
            + (if ($v.not_shown | length) > 0 then "\n<b>Could not verify:</b>" + ($v.not_shown | bullets) else "" end)
          elif $v.status == "pending" then "<i>Reviewer is still reading this request; the dialog will update when it's done.</i>"
          elif $v.status == "disabled" then "<i>No reviewer configured.</i>"
+         elif $v.status == "skipped" and $v.by == "collector" then "<b>No review:</b> \(($v.reason // "") | cut(300) | esc)"
          elif $v.status == "skipped" then "<i>Not reviewed: \(($v.reason // "skipped") | esc).</i>"
          else "<b>No review</b>: " + (($v.reason // $v.status) | esc)
          end)
@@ -465,6 +466,17 @@ in
 {
   options.nuketown.approvalDaemon = {
     enable = lib.mkEnableOption "Nuketown operation broker";
+
+    renderer = lib.mkOption {
+      type = lib.types.path;
+      readOnly = true;
+      default = renderRequest;
+      description = ''
+        jq program the built-in prompter uses to render a request
+        (`jq -rn --slurpfile req request.json --slurpfile rev review.json
+        -f <renderer>`), for custom prompters and tests.
+      '';
+    };
 
     prompter = lib.mkOption {
       type = lib.types.nullOr lib.types.str;

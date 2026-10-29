@@ -558,6 +558,11 @@
             inherit nixpkgs-unstable home-manager impermanence sops-nix;
             nuketownModule = ./module.nix;
           };
+          vm-approval-decrypt = import ./tests/approval-decrypt.nix {
+            pkgs = pkgsFor system;
+            inherit nixpkgs-unstable home-manager impermanence sops-nix;
+            nuketownModule = ./module.nix;
+          };
         }
       );
 

@@ -58,13 +58,37 @@ pkgs.testers.runNixOSTest {
         assert rev["status"] == "ok" and rev["summary"] == "runs " + req["display"], rev
         assert rev["risk"] == "low" and rev["recommendation"] == "approve", rev
 
-    with subtest("hung reviewer: asked anyway, review unavailable"):
-        machine.succeed("echo hang > /tmp/reviewer-mode")
+    def pending_then(mode):
+        """Prompt appears while the review is still running; the review
+        lands in the request dir while the dialog is up."""
+        machine.succeed(f"echo {mode} > /tmp/reviewer-mode")
+        machine.succeed("rm -f /tmp/prompter-go && touch /tmp/prompter-wait")
         n0 = prompt_count()
-        machine.succeed(as_ada("sudo true"))
-        assert prompt_count() == n0 + 1
+        start_bg("ada", "sudo true")
+        machine.wait_until_succeeds(f"test -e /tmp/prompts/{n0 + 1}/request.json", timeout=60)
         _, _, rev = last_prompt()
-        assert rev["status"] == "unavailable" and "timed out" in rev["reason"], rev
+        assert rev["status"] == "pending", rev
+        d = machine.succeed(f"cat /tmp/prompts/{n0 + 1}/dir").strip()
+        machine.wait_until_succeeds(f"jq -e '.status != \"pending\"' {d}/review.json", timeout=30)
+        machine.succeed("rm /tmp/prompter-wait && touch /tmp/prompter-go")
+        rc, _ = wait_bg()
+        assert rc == 0, rc
+        return review_at_answer(n0 + 1)
+
+    with subtest("slow reviewer: asked while pending, review lands in the open dialog"):
+        r = pending_then("slow")
+        assert r["status"] == "ok" and r["summary"] == "slow review", r
+
+    with subtest("hung reviewer: asked while pending, then review unavailable"):
+        r = pending_then("hang")
+        assert r["status"] == "unavailable" and "timed out" in r["reason"], r
+
+    with subtest("decided before the review lands"):
+        machine.succeed("echo hang > /tmp/reviewer-mode")
+        machine.succeed(as_ada("sudo --why early-answer true"))
+        rec = [r for r in journal_records() if r["argv"] == ["true"]][-1]
+        assert rec["review"]["status"] == "unavailable", rec
+        machine.succeed("echo ok > /tmp/reviewer-mode")
 
     with subtest("garbage / failing reviewer: asked anyway"):
         for mode, why in [("garbage", "not valid"), ("fail", "exit 9")]:
@@ -90,10 +114,57 @@ pkgs.testers.runNixOSTest {
         machine.succeed(as_ada("sops-lock"))
         machine.fail("test -e /run/sops-age/keys.txt")
 
+    with subtest("deny reason reaches the requester and the journal"):
+        answer("deny")
+        machine.succeed("echo 'too risky today' > /tmp/prompter-reason && chmod 644 /tmp/prompter-reason")
+        rc, out = machine.execute(as_ada("sudo touch /root/nope 2>&1"))
+        assert rc == 1 and "Request denied." in out and "Reason: too risky today" in out, (rc, out)
+        rec = [r for r in journal_records() if r["argv"] == ["touch", "/root/nope"]][-1]
+        assert rec["decision"] == "denied" and rec["reason"] == "too risky today", rec
+        machine.succeed("rm /tmp/prompter-reason")
+        answer("approve")
+
+    with subtest("--requester: root only; human requests skip the review"):
+        out = machine.fail(as_ada("/run/wrappers/bin/sudo -u nuketown-approval /run/current-system/sw/bin/nuketown-approve --requester human -- true 2>&1"))
+        assert "only accepted from root" in out, out
+        out = machine.fail(as_ada("/run/wrappers/bin/sudo -u nuketown-approval /run/current-system/sw/bin/nuketown-approve --why x --requester human -- true 2>&1"))
+        assert "--requester" in out, out
+        out = machine.succeed("sudo -u nuketown-approval nuketown-approve --requester human --why 'apply my change' -- id -un")
+        assert out.strip() == "root", out
+        _, req, rev = last_prompt()
+        assert req["requester"] == "human" and req["origin"] == "root", req
+        assert rev["status"] == "skipped", rev
+        machine.succeed("sudo -u nuketown-approval nuketown-approve --requester loom-update -- true")
+        _, req, rev = last_prompt()
+        assert req["requester"] == "loom-update" and rev["status"] == "ok", (req, rev)
+
+    with subtest("approval-kinds: collector, prompt, NUKETOWN_APPROVAL_DIR"):
+        n0 = prompt_count()
+        out = machine.succeed(as_ada("sudo --why 'demo kind' kind-cmd"))
+        assert out == "dir-has: DIFF\ndemo\n", repr(out)
+        _, req, _ = last_prompt()
+        assert req["kind"]["name"] == "demo" and req["kind"]["review_prompt"].endswith("demo-prompt.md"), req
+        assert req["prompt_timeout"] == 0, req
+        assert machine.succeed(f"cat /tmp/prompts/{n0 + 1}/kind/diff.txt").strip() == "DIFF"
+        assert "running as root" in machine.succeed(f"cat /tmp/prompts/{n0 + 1}/kind/collect.log")
+        # Ordinary requests have no kind and the default timeout.
+        machine.succeed(as_ada("sudo true"))
+        _, req, _ = last_prompt()
+        assert req["kind"] is None and req["prompt_timeout"] == 120, req
+
+    with subtest("approval-kinds: a refusing collector stops the request, no dialog"):
+        machine.succeed("touch /tmp/collect-refuse")
+        n0 = prompt_count()
+        rc, out = machine.execute(as_ada("sudo kind-cmd 2>&1"))
+        assert rc == 5 and "refused, rebase onto abc123" in out, (rc, out)
+        assert prompt_count() == n0
+        rec = [r for r in journal_records() if r["argv"] == ["kind-cmd"]][-1]
+        assert rec["decision"] == "refused" and rec["kind"] == "demo", rec
+        machine.succeed("rm /tmp/collect-refuse")
+
     with subtest("audit: journal record and persisted request dir"):
         machine.execute(as_ada("sudo sh -c 'exit 3'"))
-        recs = [json.loads(l) for l in machine.succeed("journalctl -t nuketown-approval -o cat").splitlines() if l.startswith("{")]
-        rec = [r for r in recs if r["argv"] == ["sh", "-c", "exit 3"]][-1]
+        rec = [r for r in journal_records() if r["argv"] == ["sh", "-c", "exit 3"]][-1]
         assert rec["requester"] == "ada" and rec["exit"] == 3 and rec["decision"] == "approved", rec
         assert rec["review"]["status"] == "ok", rec
         machine.succeed(f"test -f /var/lib/nuketown-approval/{rec['id']}/request.json")

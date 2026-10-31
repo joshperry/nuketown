@@ -119,7 +119,11 @@ let
         ${pkgs.coreutils}/bin/head -c 200000 "$f"
       done
     } > "''${TMPDIR:-/tmp}/nuketown-review-$$.md"
-    out=$(claude -p --output-format text < "''${TMPDIR:-/tmp}/nuketown-review-$$.md")
+    # No tools, MCP servers or saved session: the review reads what it is
+    # given and nothing else, and each one starts fresh.
+    out=$(cd "''${TMPDIR:-/tmp}" && claude -p --output-format text \
+      --tools "" --no-session-persistence --strict-mcp-config \
+      < "''${TMPDIR:-/tmp}/nuketown-review-$$.md")
     rc=$?
     ${pkgs.coreutils}/bin/rm -f "''${TMPDIR:-/tmp}/nuketown-review-$$.md"
     [ $rc -eq 0 ] || exit $rc

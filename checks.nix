@@ -223,6 +223,25 @@ let
     };
   };
 
+  # Two agents share one sops-held setup-token; bob keeps his own login.
+  tokenConfig = { pkgs, ... }: let
+    fakeClaude = pkgs.writeShellScriptBin "claude" ''echo "token=$CLAUDE_CODE_OAUTH_TOKEN args=$*"'';
+  in {
+    sops.validateSopsFiles = false;
+    nuketown = {
+      enable = true;
+      domain = "nuketown.test";
+      humanUser = "human";
+      sopsFile = ./checks.nix;  # placeholder; never decrypted at eval
+      claudeCode.oauthTokenSecret = "nuketown/claude-oauth-token";
+      agents.ada = { enable = true; uid = 1100; role = "software"; description = "Token agent"; claudeCode.enable = true; claudeCode.package = fakeClaude; };
+      # a token file that exists at build time, so the check can run the wrapper
+      agents.rev = { enable = true; uid = 1101; role = "reviewer"; description = "Token agent"; claudeCode.enable = true; claudeCode.package = fakeClaude;
+        claudeCode.oauthTokenFile = "${pkgs.writeText "token" "tok123"}"; };
+      agents.bob = { enable = true; uid = 1102; role = "software"; description = "Own login"; claudeCode.enable = true; claudeCode.oauthTokenFile = null; };
+    };
+  };
+
   # ── Evaluated Configs ─────────────────────────────────────────────
 
   fullCfg = evalConfig fullAgentConfig [];
@@ -230,6 +249,7 @@ let
   customCfg = evalConfig customNamingConfig [];
   daemonCfg = evalConfig daemonConfig [];
   xmppCfg = evalConfig xmppConfig [];
+  tokenCfg = evalConfig tokenConfig [];
 
   # Shorthand accessors
   adaHM = fullCfg.home-manager.users.ada;
@@ -434,6 +454,35 @@ in {
     (assertEq "settings.permissions.defaultMode"
       adaCC.settings.permissions.defaultMode "allowEdits")
   ];
+
+  claude-oauth-token = let
+    tokenPath = tokenCfg.sops.secrets."nuketown/claude-oauth-token".path;
+    pkgOf = n: tokenCfg.home-manager.users.${n}.programs.claude-code.package;
+  in mkCheck "claude-oauth-token" [
+    (assertEq "secret group" tokenCfg.sops.secrets."nuketown/claude-oauth-token".group "nuketown-claude-token")
+    (assertEq "secret mode" tokenCfg.sops.secrets."nuketown/claude-oauth-token".mode "0440")
+    (assertEq "ada's token file" tokenCfg.nuketown.agents.ada.claudeCode.oauthTokenFile tokenPath)
+    (assertMsg "ada in the token group" (builtins.elem "nuketown-claude-token" tokenCfg.users.users.ada.extraGroups))
+    (assertMsg "rev in the token group" (builtins.elem "nuketown-claude-token" tokenCfg.users.users.rev.extraGroups))
+    (assertMsg "bob not in the token group" (!(builtins.elem "nuketown-claude-token" tokenCfg.users.users.bob.extraGroups)))
+    (assertContains "ada's claude is the token wrapper" (pkgOf "ada").name "oauth-token")
+    (assertNotContains "bob's claude is the plain package" (pkgOf "bob").name "oauth-token")
+  ];
+
+  # the wrappers themselves: ada's reads the sops path; rev's runs
+  claude-oauth-token-run = let
+    tokenPath = tokenCfg.sops.secrets."nuketown/claude-oauth-token".path;
+    pkgOf = n: tokenCfg.home-manager.users.${n}.programs.claude-code.package;
+  in pkgs.runCommand "nuketown-check-claude-oauth-token-run" {} ''
+    grep -qF ${tokenPath} ${pkgOf "ada"}/bin/claude
+    r=$(${pkgOf "rev"}/bin/claude -p hi)
+    [ "$r" = "token=tok123 args=-p hi" ] || { echo "got: $r"; exit 1; }
+    r=$(CLAUDE_CODE_OAUTH_TOKEN=mine ${pkgOf "rev"}/bin/claude)
+    [ "$r" = "token=mine args=" ] || { echo "an existing token was replaced: $r"; exit 1; }
+    if ANTHROPIC_API_KEY=x ${pkgOf "rev"}/bin/claude 2>err; then echo "ran with an API key set"; exit 1; fi
+    grep -q "ANTHROPIC_API_KEY is set" err
+    touch $out
+  '';
 
   claude-code-agent-prompt-frontmatter = mkCheck "claude-code-agent-prompt-frontmatter" [
     (assertContains "frontmatter name" adaPrompt "name: ada-software")

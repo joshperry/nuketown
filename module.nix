@@ -290,6 +290,18 @@ let
           default = pkgs.unstable.claude-code;
           description = "Claude Code package for the agent. Set to null to skip package installation.";
         };
+        oauthTokenFile = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = cfg.claudeCode.oauthTokenFile;
+          defaultText = lib.literalExpression "config.nuketown.claudeCode.oauthTokenFile";
+          description = ''
+            File holding a `claude setup-token` token. When set, the agent's
+            `claude` reads it into CLAUDE_CODE_OAUTH_TOKEN (the subscription,
+            not API billing) and refuses to run while ANTHROPIC_API_KEY is
+            set, since that key would take precedence. Set to null to keep
+            the agent's own `/login`.
+          '';
+        };
         settings = lib.mkOption {
           type = lib.types.attrs;
           default = {};
@@ -434,6 +446,31 @@ let
   sshKeyAgents = lib.filterAttrs (_: a: a.enable && a.secrets.sshKey != null) cfg.agents;
   sudoAgents = lib.filterAttrs (_: a: a.enable && a.sudo.enable) cfg.agents;
   claudeCodeAgents = lib.filterAttrs (_: a: a.enable && a.claudeCode.enable) cfg.agents;
+  tokenAgents = lib.filterAttrs (_: a: a.claudeCode.oauthTokenFile != null) claudeCodeAgents;
+
+  # claude that signs in with the token file; an API key would win over it
+  # (and bill per token), so refuse while one is set.
+  claudeWithToken = agent: pkgs.symlinkJoin {
+    name = "${agent.claudeCode.package.name}-oauth-token";
+    paths = [ agent.claudeCode.package ];
+    inherit (agent.claudeCode.package) meta;
+    postBuild = ''
+      rm $out/bin/claude
+      cat > $out/bin/claude <<'SH'
+      #!${pkgs.runtimeShell}
+      if [ -n "''${ANTHROPIC_API_KEY:-}" ]; then
+        echo "claude: ANTHROPIC_API_KEY is set; it would be used instead of the subscription token. Unset it." >&2
+        exit 1
+      fi
+      if [ -z "''${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+        CLAUDE_CODE_OAUTH_TOKEN=$(cat ${lib.escapeShellArg agent.claudeCode.oauthTokenFile}) || exit 1
+        export CLAUDE_CODE_OAUTH_TOKEN
+      fi
+      exec ${agent.claudeCode.package}/bin/claude "$@"
+      SH
+      chmod +x $out/bin/claude
+    '';
+  };
   daemonAgents = lib.filterAttrs (_: a: a.enable && a.daemon.enable) cfg.agents;
   xmppAgents = lib.filterAttrs (_: a: a.enable && a.xmpp.enable) cfg.agents;
 
@@ -663,6 +700,33 @@ in
       type = lib.types.nullOr lib.types.path;
       default = null;
       description = "Default sops file for agent secrets";
+    };
+
+    claudeCode = {
+      oauthTokenSecret = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "nuketown/claude-oauth-token";
+        description = ''
+          sops secret holding a `claude setup-token` token, shared by every
+          Claude Code agent whose oauthTokenFile is left at the default: one
+          sign-in per machine instead of one per agent. Readable by the
+          nuketown-claude-token group.
+        '';
+      };
+      oauthTokenFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default =
+          if cfg.claudeCode.oauthTokenSecret != null && options ? sops
+          then config.sops.secrets.${cfg.claudeCode.oauthTokenSecret}.path
+          else null;
+        defaultText = lib.literalExpression "the oauthTokenSecret's path, or null";
+        description = ''
+          Default token file for every agent's claudeCode.oauthTokenFile.
+          Point it at a file written at runtime (e.g. by a sign-in step)
+          instead of using oauthTokenSecret.
+        '';
+      };
     };
 
     basePackages = lib.mkOption {
@@ -906,6 +970,7 @@ in
       (lib.mkIf (sudoAgents != {} && cfg.humanUser != null) {
         ${cfg.humanUser}.extraGroups = [ "nuketown-secrets" ];
       })
+      (lib.mapAttrs (_: _: { extraGroups = [ "nuketown-claude-token" ]; }) tokenAgents)
     ];
 
     users.groups = lib.mapAttrs (name: agent: {
@@ -914,6 +979,9 @@ in
     // lib.optionalAttrs (sudoAgents != {}) {
       nuketown-broker = {};
       nuketown-secrets = {};
+    }
+    // lib.optionalAttrs (tokenAgents != {}) {
+      nuketown-claude-token = {};
     };
 
     # ── Home Manager ─────────────────────────────────────────────
@@ -970,7 +1038,10 @@ in
 
         programs.claude-code = {
           enable = true;
-          package = agent.claudeCode.package;
+          package =
+            if agent.claudeCode.package != null && agent.claudeCode.oauthTokenFile != null
+            then claudeWithToken agent
+            else agent.claudeCode.package;
           settings = agent.claudeCode.settings;
           agents = {
             ${agent.claudeCode.agentName} = prompt.agentDef;
@@ -1175,6 +1246,13 @@ in
           owner = name;
         };
       }
-    ) enabledAgents);
+    ) enabledAgents
+    ++ [ (lib.optionalAttrs (cfg.claudeCode.oauthTokenSecret != null) {
+      ${cfg.claudeCode.oauthTokenSecret} = {
+        sopsFile = cfg.sopsFile;
+        group = "nuketown-claude-token";
+        mode = "0440";
+      };
+    }) ]);
   });
 }

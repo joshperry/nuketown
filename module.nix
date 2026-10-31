@@ -260,10 +260,11 @@ let
         };
         command = lib.mkOption {
           type = lib.types.str;
-          default = "${pkgs.unstable.claude-code}/bin/claude --dangerously-skip-permissions";
+          default = "${if config.claudeCode.package != null then agentClaude config else pkgs.unstable.claude-code}/bin/claude --dangerously-skip-permissions";
+          defaultText = lib.literalExpression ''"<the agent's claude-code, with its oauthTokenFile>/bin/claude --dangerously-skip-permissions"'';
           description = ''
             Command to run as the agent in the right pane.
-            Defaults to claude-code via direct store path. Replace
+            Defaults to the agent's claude-code via direct store path. Replace
             with a custom shell agent when you build one.
           '';
         };
@@ -471,6 +472,13 @@ let
       chmod +x $out/bin/claude
     '';
   };
+
+  # The agent's claude-code: the token wrapper when it signs in with one.
+  # The portal and home-manager both use this, so neither skips the token.
+  agentClaude = agent:
+    if agent.claudeCode.enable && agent.claudeCode.package != null && agent.claudeCode.oauthTokenFile != null
+    then claudeWithToken agent
+    else agent.claudeCode.package;
   daemonAgents = lib.filterAttrs (_: a: a.enable && a.daemon.enable) cfg.agents;
   xmppAgents = lib.filterAttrs (_: a: a.enable && a.xmpp.enable) cfg.agents;
 
@@ -1038,10 +1046,7 @@ in
 
         programs.claude-code = {
           enable = true;
-          package =
-            if agent.claudeCode.package != null && agent.claudeCode.oauthTokenFile != null
-            then claudeWithToken agent
-            else agent.claudeCode.package;
+          package = agentClaude agent;
           settings = agent.claudeCode.settings;
           agents = {
             ${agent.claudeCode.agentName} = prompt.agentDef;

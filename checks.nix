@@ -467,6 +467,8 @@ in {
     (assertMsg "bob not in the token group" (!(builtins.elem "nuketown-claude-token" tokenCfg.users.users.bob.extraGroups)))
     (assertContains "ada's claude is the token wrapper" (pkgOf "ada").name "oauth-token")
     (assertNotContains "bob's claude is the plain package" (pkgOf "bob").name "oauth-token")
+    (assertContains "ada's portal runs the token wrapper" tokenCfg.nuketown.agents.ada.portal.command "oauth-token")
+    (assertNotContains "bob's portal runs the plain package" tokenCfg.nuketown.agents.bob.portal.command "oauth-token")
   ];
 
   # the wrappers themselves: ada's reads the sops path; rev's runs

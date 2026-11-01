@@ -563,6 +563,11 @@
             inherit nixpkgs-unstable home-manager impermanence sops-nix;
             nuketownModule = ./module.nix;
           };
+          vm-approval-card = import ./tests/approval-card.nix {
+            pkgs = pkgsFor system;
+            inherit nixpkgs-unstable home-manager impermanence sops-nix;
+            nuketownModule = ./module.nix;
+          };
         }
       );
 
@@ -572,6 +577,7 @@
           pkgs = pkgsFor system;
         in {
           nuketown-daemon = pkgs.callPackage ./daemon.nix {};
+          nuketown-prompter = pkgs.callPackage ./prompter {};
         }
         // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
           # Self-contained qcow2 of the demo VM. Build on any Linux

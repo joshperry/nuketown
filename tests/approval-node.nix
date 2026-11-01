@@ -8,8 +8,11 @@
 #   waits for /tmp/prompter-go before answering. review.json as it was
 #   when answering is kept as review-at-answer.json, and the built-in
 #   renderer's dialog text for it as text.txt.
+#   With card = true the prompter is the real approval card instead
+#   (cardPrompter) behind a wrapper that records each card under
+#   /tmp/cards/<n>/ (dir, state.json from the test hook, stdout, rc).
 # - reviewer runs a stub review command whose behaviour comes from
-#   /tmp/reviewer-mode (ok|slow|hang|garbage|fail) and appends the
+#   /tmp/reviewer-mode (ok|slow|card|hang|garbage|fail) and appends the
 #   request id to /tmp/reviewer-log. The prompt is shown after
 #   promptDelay (2 s) even while the review is still running.
 # - kind "demo" for kind-cmd: its collector writes kind/diff.txt, or
@@ -19,12 +22,26 @@
 # - ada (any command) and eve (approvalAllow = [ "id" ]) can sudo;
 #   bob is a plain user to test `sudo -u`.
 
-{ nuketownModule, home-manager, impermanence, sops-nix, nixpkgs-unstable, touchApproves ? false }:
+{ nuketownModule, home-manager, impermanence, sops-nix, nixpkgs-unstable, touchApproves ? false, card ? false }:
 
-{ pkgs, config, ... }:
+{ pkgs, lib, config, ... }:
 
 let
   renderer = config.home-manager.users.human.nuketown.approvalDaemon.renderer;
+  cardPrompter = config.home-manager.users.human.nuketown.approvalDaemon.cardPrompter;
+
+  cardWrapper = pkgs.writeShellScript "card-prompter" ''
+    set -u
+    n=$(${pkgs.coreutils}/bin/ls /tmp/cards | ${pkgs.coreutils}/bin/wc -l)
+    d=/tmp/cards/$((n + 1))
+    ${pkgs.coreutils}/bin/mkdir -p "$d"
+    echo "$1" > "$d/dir"
+    NUKETOWN_PROMPTER_STATE=$d/state.json ${lib.getExe cardPrompter} "$1" > "$d/stdout"
+    rc=$?
+    echo "$rc" > "$d/rc"
+    ${pkgs.coreutils}/bin/cat "$d/stdout"
+    exit "$rc"
+  '';
 
   prompter = pkgs.writeShellScript "stub-prompter" ''
     set -u
@@ -77,6 +94,13 @@ let
       slow)
         ${pkgs.coreutils}/bin/sleep 4
         echo '{"summary": "slow review", "risk": "medium", "recommendation": "ask"}' ;;
+      card)
+        ${pkgs.coreutils}/bin/sleep 5
+        ${pkgs.jq}/bin/jq -nc '{headline: "Read-only, but shows ada other agents\u0027 approval records.",
+          summary: "Lists and prints review.json from the two newest approval directories, which ada cannot read itself; the output goes back to ada.",
+          risk: "low", recommendation: "approve",
+          notes: ["Output returns to ada, including other agents\u0027 requests and reviews.", "<b>not bold</b> & <i>plain</i>"],
+          not_shown: ["Which agents own the two newest directories."]}' ;;
       hang) exec ${pkgs.coreutils}/bin/sleep 600 ;;
       garbage) echo "this is not json" ;;
       *) exit 9 ;;
@@ -101,7 +125,7 @@ in
   home-manager.users.human = {
     imports = [ ../approval-daemon.nix ];
     home.stateVersion = "25.11";
-    nuketown.approvalDaemon = { enable = true; prompter = "${prompter}"; inherit touchApproves; };
+    nuketown.approvalDaemon = { enable = true; prompter = "${if card then cardWrapper else prompter}"; inherit touchApproves; };
   };
 
   environment.systemPackages = [ pkgs.socat pkgs.gnupg pkgs.jq kindCmd undoCmd ];

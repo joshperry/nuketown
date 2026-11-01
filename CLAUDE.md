@@ -44,7 +44,7 @@ Agent home directories live on a btrfs subvolume (`@agents`) that rolls back to 
 
 ### Security Model
 - **Device access**: Per-agent udev rules with ACLs (no broad permissions)
-- **Sudo approval**: Interactive zenity dialogs on human's desktop (no passwords)
+- **Sudo approval**: An approval card (GTK 4) on the human's desktop (no passwords)
 - **Filesystem isolation**: Standard Unix permissions + targeted ACLs
 - **Git collaboration**: Agents work in their own clones, push branches
 
@@ -55,6 +55,7 @@ nuketown/
 ├── module.nix            # Main NixOS module (~770 lines)
 ├── approval.nix          # nuketown-approval service user (sudo requests, snapshots, reviewer, audit)
 ├── approval-daemon.nix   # Home-manager module for sudo approval daemon
+├── prompter/             # nuketown-prompter: the approval card (Python + GTK 4, X11/Wayland)
 ├── checks.nix            # Pure nix evaluation checks (nix flake check)
 ├── flake.nix             # Flake: test VMs, dev shell, apps, checks
 ├── example.nix           # Example configuration with two agents (ada, vox)
@@ -67,7 +68,8 @@ nuketown/
 │   ├── approval-node.nix      # Shared VM node for the approval NixOS tests
 │   ├── sudo-approval-bypass.nix  # VM check: no path to root without approval
 │   ├── approval-flow.nix      # VM check: snapshots, reviewer, kinds, requester, audit
-│   └── approval-decrypt.nix   # VM check: PIN prompt after Approve, touch-only approval
+│   ├── approval-decrypt.nix   # VM check: PIN prompt after Approve, touch-only approval
+│   └── approval-card.nix      # VM check: the card on X11/i3 and Wayland (xdotool, screenshots)
 ├── README.md             # User-facing documentation
 ├── CLAUDE.md             # This file - developer guidance
 └── docs/testing.md       # Testing session notes
@@ -152,7 +154,7 @@ When `sudo.enable = true` for an agent:
    (human or timer requests; the human's own requests skip the review).
 3. It sends `REQUEST:<id>` to the human's broker (approval-daemon.nix), the only
    other member of the broker socket's group. The broker shows the request
-   (zenity by default, or `nuketown.approvalDaemon.prompter`) and answers
+   (the built-in card, `prompter/`, or `nuketown.approvalDaemon.prompter`) and answers
    `APPROVED` or `DENIED[:reason]`; the reason is printed to the agent. For a
    decrypt, gpg's PIN prompt only appears after Approve; with
    `approvalDaemon.touchApproves` a touch-only decrypt races the dialog.
@@ -250,7 +252,7 @@ home-manager.users.josh = {
 };
 ```
 
-This must be enabled in the **human's** home-manager config (not the agent's) since it needs access to the graphical session for zenity dialogs.
+This must be enabled in the **human's** home-manager config (not the agent's) since it needs access to the graphical session for the approval card.
 
 ## Usage Example
 
@@ -319,7 +321,7 @@ To use ephemeral agent homes:
 - **Portal into agent workspace:** `portal-ada` or `portal` (with fzf picker)
 - **View agent commits:** `git log --author=ada`
 - **Verify signatures:** `git log --verify-signatures --author=ada`
-- **Approve sudo requests:** Zenity dialog appears automatically
+- **Approve sudo requests:** The approval card appears automatically (Deny has the keyboard; ⓘ shows the details)
 - **Check agent status:** `loginctl show-user ada`
 
 ### As an Agent (Claude Code)
@@ -371,7 +373,7 @@ See the `mkUdevRules` definition in `module.nix` for the rule generation logic.
 Three layers across two files:
 1. **Agent's sudo shim** (`module.nix`, home-manager package): Parses sudo flags and shadows `/run/wrappers/bin/sudo`
 2. **Approval wrapper** (`module.nix`, system package): Connects to socket, waits for approval, executes `sudo` with approved flags
-3. **Approval daemon** (`approval-daemon.nix`, user service): Shows zenity dialog, returns APPROVED/DENIED
+3. **Approval daemon** (`approval-daemon.nix`, user service): Shows the approval card, returns APPROVED/DENIED
 
 **Flag Handling Flow:**
 When an agent runs `sudo -u josh ./command`:

@@ -9,7 +9,8 @@ let
   runDir = "/run/nuketown-approval";
 
   # Renders a request directory (written by nuketown-approve, see
-  # approval.nix) as Pango markup for the zenity dialog. Everything the
+  # approval.nix) as Pango markup, for zenity-style custom prompters
+  # (cfg.renderer; the built-in card renders request.json itself). Everything the
   # agent or the reviewer wrote is escaped; backslashes are doubled
   # because zenity unescapes \n etc. in --text.
   renderRequest = pkgs.writeText "nuketown-render-request.jq" ''
@@ -44,88 +45,15 @@ let
          end)
   '';
 
-  # Default prompter: zenity, with a "Show files" button when the request
-  # has snapshots or kind files and a "Deny with reason" button. Exit 0 =
-  # approve; on deny, stdout is the reason (may be empty). While the
-  # review is pending the dialog is re-shown as soon as it lands.
-  # NUKETOWN_PROMPT_NOTE (from the broker) is appended to the text.
-  zenityPrompter = pkgs.writeShellScript "nuketown-zenity-prompter" ''
-    set -uo pipefail
-    export PATH=${lib.makeBinPath (with pkgs; [ coreutils jq zenity ])}
-    DIR=$1
-    ZPID=""
-    FILES=$(mktemp) OUT=$(mktemp)
-    trap 'rm -f "$FILES" "$OUT"' EXIT
-    trap '[ -n "$ZPID" ] && kill "$ZPID" 2>/dev/null; exit 1' TERM INT
+  # Default prompter: the approval card (prompter/, GTK 4 on X11 or
+  # Wayland). It keeps zenity's contract: exit 0 = approve; on deny the
+  # first line of stdout is the reason (may be empty); "no answer within
+  # Ns" on timeout; SIGTERM denies. Deny has the keyboard, and the card
+  # updates in place when review.json lands. NUKETOWN_PROMPT_NOTE (from
+  # the broker) is shown on the card.
+  cardPrompter = pkgs.callPackage ./prompter { };
 
-    review_status() { jq -r '.status // "missing"' "$DIR/review.json" 2>/dev/null || echo missing; }
-
-    NFILES=0
-    while IFS= read -r -d "" path && IFS= read -r -d "" snap && IFS= read -r -d "" sha; do
-      [[ "$snap" == snapshots/* && "$snap" != *..* ]] || continue
-      NFILES=$((NFILES + 1))
-      printf '==== %s\n==== sha256 %s\n\n' "$path" "$sha" >> "$FILES"
-      head -c 1048576 "$DIR/$snap" >> "$FILES"
-      printf '\n\n' >> "$FILES"
-    done < <(jq -j '.snapshots[] | .path, "\u0000", .snapshot, "\u0000", .sha256, "\u0000"' "$DIR/request.json")
-    if [ -d "$DIR/kind" ]; then
-      for f in "$DIR"/kind/*; do
-        [ -f "$f" ] || continue
-        NFILES=$((NFILES + 1))
-        printf '==== %s\n\n' "''${f#"$DIR"/}" >> "$FILES"
-        head -c 1048576 "$f" >> "$FILES"
-        printf '\n\n' >> "$FILES"
-      done
-    fi
-
-    EXTRA=(--extra-button "Deny with reason")
-    [ "$NFILES" -gt 0 ] && EXTRA+=(--extra-button "Show files")
-    TIMEOUT=$(jq -r '.prompt_timeout // 120' "$DIR/request.json")
-    [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || TIMEOUT=120
-    DEADLINE=$(( $(date +%s) + TIMEOUT ))
-
-    while true; do
-      TEXT=$(jq -rn --slurpfile req "$DIR/request.json" \
-        --slurpfile rev <(cat "$DIR/review.json" 2>/dev/null || true) \
-        -f ${renderRequest}) || exit 1
-      [ -n "''${NUKETOWN_PROMPT_NOTE-}" ] && TEXT+="\n\n$NUKETOWN_PROMPT_NOTE"
-      TOPT=()
-      if [ "$TIMEOUT" -gt 0 ]; then
-        left=$(( DEADLINE - $(date +%s) ))
-        if [ "$left" -le 0 ]; then echo "no answer within ''${TIMEOUT}s"; exit 1; fi
-        TOPT=(--timeout="$left")
-      fi
-      shown=$(review_status)
-      zenity --question --title="Nuketown: Sudo Approval" --text="$TEXT" \
-        --ok-label="Approve" --cancel-label="Deny" --default-cancel \
-        --width=640 "''${TOPT[@]}" "''${EXTRA[@]}" > "$OUT" 2>/dev/null &
-      ZPID=$!
-      replaced=0
-      while kill -0 "$ZPID" 2>/dev/null; do
-        if [ "$shown" = pending ] && [ "$(review_status)" != pending ]; then
-          kill "$ZPID" 2>/dev/null; replaced=1; break
-        fi
-        sleep 0.3
-      done
-      wait "$ZPID"; RC=$?; ZPID=""
-      [ "$replaced" = 1 ] && continue
-      [ $RC -eq 0 ] && exit 0
-      case "$(cat "$OUT")" in
-        "Show files")
-          zenity --text-info --title="Nuketown: files in this request" \
-            --filename="$FILES" --width=900 --height=700 2>/dev/null
-          continue ;;
-        "Deny with reason")
-          zenity --entry --title="Nuketown: deny" --text="Reason (shown to the requester):" \
-            --width=500 2>/dev/null | head -c 500
-          exit 1 ;;
-      esac
-      [ $RC -eq 5 ] && echo "no answer within ''${TIMEOUT}s"
-      exit 1
-    done
-  '';
-
-  prompter = if cfg.prompter != null then cfg.prompter else "${zenityPrompter}";
+  prompter = if cfg.prompter != null then cfg.prompter else lib.getExe cardPrompter;
 
   # Asks about a decrypt with no command (sops-unlock). Exit 0 = go ahead.
   decryptPrompter = pkgs.writeShellScript "nuketown-decrypt-prompter" ''
@@ -474,9 +402,21 @@ in
       readOnly = true;
       default = renderRequest;
       description = ''
-        jq program the built-in prompter uses to render a request
+        jq program that renders a request as Pango markup
         (`jq -rn --slurpfile req request.json --slurpfile rev review.json
-        -f <renderer>`), for custom prompters and tests.
+        -f <renderer>`), for custom (e.g. zenity) prompters and tests.
+      '';
+    };
+
+    cardPrompter = lib.mkOption {
+      type = lib.types.package;
+      readOnly = true;
+      default = cardPrompter;
+      description = ''
+        The built-in approval card (nuketown-prompter, GTK 4), the
+        prompter used when `prompter` is null. For wrappers and tests;
+        with NUKETOWN_PROMPTER_STATE=<file> it writes what it shows to
+        that file as JSON after every change.
       '';
     };
 
@@ -487,7 +427,7 @@ in
         Command that asks the human about a sudo request. It gets the
         request directory (request.json, review.json, snapshots/) as its
         only argument and exits 0 to approve, anything else to deny.
-        null uses the built-in zenity dialog.
+        null uses the built-in approval card (`cardPrompter`).
 
         On deny, the first line of stdout is the reason shown to the
         requester. review.json may be {"status":"pending"} when the

@@ -727,7 +727,9 @@ in {
     (assertEq "broker service present"
       (builtins.hasAttr "nuketown-broker" humanHM.systemd.user.services) true)
     (assertEq "reviewer off by default" cfg.nuketown.approval.reviewer.enable false)
-    (assertEq "zenity prompter by default" humanHM.nuketown.approvalDaemon.prompter null)
+    (assertEq "built-in card prompter by default" humanHM.nuketown.approvalDaemon.prompter null)
+    (assertEq "the built-in prompter is the card"
+      (nixpkgs.lib.getName humanHM.nuketown.approvalDaemon.cardPrompter) "nuketown-prompter")
   ]);
 
 }

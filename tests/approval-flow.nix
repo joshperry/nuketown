@@ -78,10 +78,13 @@ pkgs.testers.runNixOSTest {
     with subtest("slow reviewer: asked while pending, review lands in the open dialog"):
         r = pending_then("slow")
         assert r["status"] == "ok" and r["summary"] == "slow review", r
+        # timing lands with the review itself, not in a later write
+        assert isinstance(r["seconds"], int) and r["seconds"] >= 1 and r["started"].endswith("Z"), r
 
     with subtest("hung reviewer: asked while pending, then review unavailable"):
         r = pending_then("hang")
         assert r["status"] == "unavailable" and "timed out" in r["reason"], r
+        assert r["seconds"] >= 6, r
 
     with subtest("decided before the review lands"):
         machine.succeed("echo hang > /tmp/reviewer-mode")

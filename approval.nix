@@ -463,28 +463,37 @@ ${kindCase}
         && mv -f "$DIR/review.json.tmp" "$DIR/review.json"
     }
     run_review() {
-      local out rc
+      local out rc t0
+      t0=$(date +%s)
+      # Every outcome records when the review started and how long it took,
+      # so a slow or timed-out review can be told apart from a slow machine
+      # or a slow API afterwards.
+      timed() {
+        local filter=$1; shift
+        write_review "$@" --arg started "$(date -u -d "@$t0" +%FT%TZ)" \
+          --argjson seconds "$(( $(date +%s) - t0 ))" "$filter + {started:\$started, seconds:\$seconds}"
+      }
       out=$(timeout --kill-after=5 ${toString acfg.reviewer.timeout} \
               "$SUDO" -H -u ${lib.escapeShellArg (toString acfg.reviewer.agent)} -- ${reviewCommand} "$DIR" \
               < /dev/null 2> "$DIR/review.stderr" | head -c 65536)
       rc=''${PIPESTATUS[0]}
       if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
-        write_review --arg r "reviewer timed out after ${toString acfg.reviewer.timeout}s" '{status:"unavailable", reason:$r}'
+        timed '{status:"unavailable", reason:$r}' --arg r "reviewer timed out after ${toString acfg.reviewer.timeout}s"
       elif [ "$rc" != 0 ]; then
-        write_review --arg r "reviewer failed (exit $rc)" '{status:"unavailable", reason:$r}'
+        timed '{status:"unavailable", reason:$r}' --arg r "reviewer failed (exit $rc)"
       elif printf '%s' "$out" | jq -e '
              (.summary | type == "string") and
              (.risk | IN("low", "medium", "high")) and
              (.recommendation | IN("approve", "deny", "ask")) and
              ((.notes // []) | type == "array") and
              ((.not_shown // []) | type == "array")' > /dev/null 2>&1; then
-        printf '%s' "$out" | jq '{status:"ok", headline:((.headline // "") | tostring | .[0:200]),
+        timed '$o[0] | {status:"ok", headline:((.headline // "") | tostring | .[0:200]),
           summary:.summary[0:2000], risk, recommendation,
           notes:((.notes // []) | map(tostring | .[0:500]) | .[0:20]),
-          not_shown:((.not_shown // []) | map(tostring | .[0:500]) | .[0:20])}' > "$DIR/review.json.tmp" \
-          && chmod 0640 "$DIR/review.json.tmp" && mv -f "$DIR/review.json.tmp" "$DIR/review.json"
+          not_shown:((.not_shown // []) | map(tostring | .[0:500]) | .[0:20])}' \
+          --slurpfile o <(printf '%s' "$out")
       else
-        write_review '{status:"unavailable", reason:"reviewer output was not valid review JSON"}'
+        timed '{status:"unavailable", reason:"reviewer output was not valid review JSON"}'
       fi
     }
     review_pending() { [ "$(jq -r .status "$DIR/review.json" 2>/dev/null)" = pending ]; }
@@ -602,8 +611,12 @@ in
       };
       timeout = lib.mkOption {
         type = lib.types.ints.positive;
-        default = 45;
-        description = "Seconds the review may take; after that it is recorded as unavailable.";
+        default = 90;
+        description = ''
+          Seconds the review may take; after that it is recorded as
+          unavailable. The card shows a pending review and updates in place
+          when it lands, so a long limit doesn't hold the human up.
+        '';
       };
       promptDelay = lib.mkOption {
         type = lib.types.ints.unsigned;

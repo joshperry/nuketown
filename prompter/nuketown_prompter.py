@@ -42,6 +42,11 @@ CUT = {"display": 800, "why": 400, "summary": 1500, "bullet": 300, "reason": 300
        "headline": 200, "note": 600, "kind": 100, "who": 64, "full": 65536}
 DEFAULT_TIMEOUT = 120
 POLL_MS = 300
+# The card takes the keyboard when it appears, possibly mid-typing in
+# another window: keys in its first second are dropped (so the rest of a
+# password can't open the reason field and become the deny reason), and
+# Approve only takes clicks after half a second.
+KEYS_AFTER_MS, APPROVE_AFTER_MS = 1000, 500
 
 # C0/C1 controls and the bidi controls that can make text read differently
 # than it runs (Trojan Source); shown as \xNN / \u{NNNN}.
@@ -256,6 +261,8 @@ class Card:
         self.labels = {}            # name → Gtk.Label, for the test hook
         self._dump_pending = False
         self.cause = None
+        self.keys_armed = False
+        self.dropped_keys = 0
         self.model = card_model(self.req, None, note)
         self._build()
         self._refresh_review(force=True)
@@ -299,7 +306,7 @@ class Card:
         w = self.win = Gtk.Window()
         w.set_title("Nuketown: Sudo Approval")
         # Not resizable: the size follows the content (it grows with the
-        # details), and i3 floats a fixed-size window like zenity's.
+        # details).
         w.set_resizable(False)
         # Modal: on X11 that is _NET_WM_STATE_MODAL, which i3 floats when
         # it manages the window (the fixed size hints come too late).
@@ -375,6 +382,7 @@ class Card:
         self.deny_btn = Gtk.Button(label="Deny")
         self.deny_btn.connect("clicked", self._on_deny)
         self.approve_btn = Gtk.Button(label="Approve")
+        self.approve_btn.set_sensitive(False)
         self.approve_btn.connect("clicked", lambda *_: self._finish(0, None, "approve"))
         actions.append(self.deny_btn)
         actions.append(self.approve_btn)
@@ -387,7 +395,7 @@ class Card:
         w.connect("notify::focus-widget", lambda *_: self._dump())
         # No default widget: Enter only activates what has the keyboard.
         w.set_focus(self.deny_btn)
-        w.connect("map", lambda *_: (self.deny_btn.grab_focus(), self._dump()))
+        w.connect("map", self._on_map)
 
     def _build_details(self):
         Gtk = self.Gtk
@@ -426,8 +434,11 @@ class Card:
         if self.files_loaded:
             return
         self.files_loaded = True
-        text = files_text(self.reqdir, self.req) or "No files in this request.\n"
-        self.files_view.get_buffer().set_text(text, -1)
+        text = files_text(self.reqdir, self.req)
+        # Room for a few lines of a file even when the details have to
+        # scroll; one line when there is nothing to show.
+        self.files_sw.set_min_content_height(120 if text else 24)
+        self.files_view.get_buffer().set_text(text or "No files in this request.\n", -1)
 
     # the review, in place
     def _poll(self):
@@ -505,8 +516,28 @@ class Card:
         return True
 
     # input
+    def _on_map(self, *_):
+        self.deny_btn.grab_focus()
+        self.GLib.timeout_add(APPROVE_AFTER_MS, self._arm_approve)
+        self.GLib.timeout_add(KEYS_AFTER_MS, self._arm_keys)
+        self._dump()
+
+    def _arm_approve(self):
+        self.approve_btn.set_sensitive(True)
+        self._dump()
+        return False
+
+    def _arm_keys(self):
+        self.keys_armed = True
+        self._dump()
+        return False
+
     def _on_key(self, _ctl, keyval, _code, _state):
         Gdk = self.Gdk
+        if not self.keys_armed:
+            self.dropped_keys += 1
+            self._dump()
+            return True
         if keyval == Gdk.KEY_Escape:
             if self.deny_row.get_visible():
                 self._close_deny()
@@ -608,6 +639,8 @@ class Card:
             "size": [self.win.get_width(), self.win.get_height()],
             "result": list(self.result) if self.result else None, "final": final,
             "cause": self.cause,
+            "armed": self.keys_armed and self.approve_btn.get_sensitive(),
+            "dropped_keys": self.dropped_keys,
         }
         tmp = self.state_file + ".tmp"
         with open(tmp, "w") as f:

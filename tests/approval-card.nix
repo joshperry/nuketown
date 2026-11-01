@@ -86,12 +86,14 @@ pkgs.testers.runNixOSTest {
     def state(n):
         return json.loads(machine.succeed(f"cat /tmp/cards/{n}/state.json"))
 
-    def wait_card(n0):
-        """The next card is up, laid out, and has the keyboard."""
+    def wait_card(n0, armed=True):
+        """The next card is up, laid out, and (armed) takes keys and Approve clicks."""
         n = n0 + 1
         machine.wait_until_succeeds(
             f"jq -e '.bounds.deny and .size[0] > 0 and .xid' /tmp/cards/{n}/state.json", timeout=60)
-        machine.sleep(0.5)    # i3 has placed it
+        if armed:
+            machine.wait_until_succeeds(f"jq -e .armed /tmp/cards/{n}/state.json", timeout=10)
+            machine.sleep(0.3)    # i3 has placed it
         return n
 
     def wait_state(n, jq, timeout=30):
@@ -132,7 +134,13 @@ pkgs.testers.runNixOSTest {
         machine.succeed("echo ok > /tmp/reviewer-mode")
         n0 = card_count()
         start_bg("ada", "sudo --why 'check the clock' date")
-        n = wait_card(n0)
+        n = n0 + 1
+        # Typing that was meant for another window doesn't reach the card
+        # in its first second (no reason field, no decision): the keys go
+        # out within ~0.1 s of the card's first state dump.
+        x(f"sh -c \"until jq -e .bounds.deny /tmp/cards/{n}/state.json >/dev/null 2>&1; do sleep 0.05; done; xdotool key space x Return\"")
+        s = wait_state(n, '.armed and .dropped_keys >= 1')
+        assert not s["deny_open"] and s["result"] is None and s["reason_text"] == "", s
         s = wait_state(n, '.review.state == "ok" and .focus == "deny"')
         assert s["title"] == "Nuketown: Sudo Approval", s["title"]
         assert s["backend"] == "GdkX11Display", s["backend"]
@@ -290,7 +298,7 @@ pkgs.testers.runNixOSTest {
 
     with subtest("Wayland (cage, no XWayland): same card, same keys"):
         wl.wait_for_file("/tmp/wl-state.json", timeout=90)
-        wl.wait_until_succeeds("jq -e '.bounds.deny and .focus == \"deny\"' /tmp/wl-state.json", timeout=60)
+        wl.wait_until_succeeds("jq -e '.bounds.deny and .focus == \"deny\" and .armed' /tmp/wl-state.json", timeout=60)
         s = json.loads(wl.succeed("cat /tmp/wl-state.json"))
         assert s["backend"] == "GdkWaylandDisplay" and s["xid"] is None, s
         assert s["texts"]["why"] == "Reason: wifi dropped <b>again</b>", s["texts"]

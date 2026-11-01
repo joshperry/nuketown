@@ -135,6 +135,13 @@ class Files(unittest.TestCase):
             self.assertNotIn("root:", t)
             self.assertNotIn("kind/link", t)
             self.assertEqual(p.files_text(d, dict(REQ)).count("===="), 1)
+            open(f"{d}/kind/collect.log", "w").close()
+            self.assertNotIn("collect.log", p.files_text(d, req))
+
+    def test_files_heading(self):
+        self.assertEqual(p.files_heading(REQ), "Files (snapshotted; the snapshot is what runs)")
+        h = p.files_heading(dict(REQ, kind={"name": "nixos-switch", "review_prompt": None}))
+        self.assertIn("kind/ is what root collected for nixos-switch", h)
 
     def test_cut(self):
         with tempfile.TemporaryDirectory() as d:

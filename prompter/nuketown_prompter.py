@@ -208,7 +208,7 @@ def files_text(reqdir, req):
     if os.path.isdir(kdir):
         for n in sorted(os.listdir(kdir)):
             p = os.path.join(kdir, n)
-            if os.path.islink(p) or not os.path.isfile(p):
+            if os.path.islink(p) or not os.path.isfile(p) or os.path.getsize(p) == 0:
                 continue
             out.append(f"==== kind/{clean(n, 255)}\n\n")
             try:
@@ -217,6 +217,15 @@ def files_text(reqdir, req):
                 out.append(f"[can't read: {e}]")
             out.append("\n\n")
     return "".join(out).rstrip("\n") + ("\n" if out else "")
+
+
+def files_heading(req):
+    """The details' files heading: kind/ files are root's, not snapshots."""
+    kind = req.get("kind") if isinstance(req.get("kind"), dict) else None
+    if kind:
+        return ("Files (snapshots are what runs; kind/ is what root collected for "
+                + clean(kind.get("name"), CUT["kind"]) + ")")
+    return "Files (snapshotted; the snapshot is what runs)"
 
 
 def load_json(path):
@@ -415,8 +424,7 @@ class Card:
         d.append(self._label("summary", ""))
         d.append(self._label(None, "Could not verify", ("nt-section",), selectable=False))
         d.append(self._label("not_shown", ""))
-        d.append(self._label(None, "Files (snapshotted; the snapshot is what runs)", ("nt-section",),
-                             selectable=False))
+        d.append(self._label(None, files_heading(self.req), ("nt-section",), selectable=False))
         self.files_view = Gtk.TextView()
         self.files_view.set_editable(False)
         self.files_view.set_cursor_visible(False)

@@ -79,23 +79,45 @@ let
     executes, not the original path.
 
     Do:
-    - Describe concretely what the command and every script will do, step
-      by step, as the human would want to know it.
+    - Work out concretely, step by step, what the command and every
+      script will do, as the human would want to know it.
     - Flag anything beyond what the stated "why" needs, anything that
       persists (users, keys, services, cron, sudoers, ssh, PATH, shell
       rc files), anything that sends data off the machine, and anything
-      destructive.
-    - List what you cannot see: files the script sources or reads at run
-      time, downloads, commands whose behaviour depends on state you can't
-      inspect. Scripts that locate siblings via $0/dirname will look in
-      the snapshot directory, not the original.
+      destructive. The command's output goes back to the agent: flag
+      anything it reveals that the agent couldn't read itself.
+    - Work out what you cannot see: files the script sources or reads at
+      run time, downloads, commands whose behaviour depends on state you
+      can't inspect. Scripts that locate siblings via $0/dirname will look
+      in the snapshot directory, not the original.
+
+    The human sees the command line next to your review and decides in
+    seconds, so write only what helps that decision:
+    - "headline": at most 12 words, the one thing the human most needs to
+      know. E.g. for a read-only command whose output shows other agents'
+      approval records: "Read-only, but shows ada other agents' approval
+      records."
+    - "summary": the effects and why they matter, not the command line
+      (the human already sees it). One sentence for low risk, up to four
+      for high.
+    - "notes": only things that could change the human's decision, at
+      most 3, one sentence each. No reassurances ("read-only: only ls and
+      cat are used"), no style or robustness nits ("unquoted $(...)
+      splits on spaces"), nothing about the command failing or finding
+      less than expected, and nothing about root being unneeded for a
+      harmless command. An empty list is normal for routine requests.
+    - "not_shown": only unknowns that could change the risk. Leave out how
+      standard system binaries resolve (PATH, /run/current-system) and the
+      inherited environment unless the command actually depends on them.
+      An empty list is normal.
 
     Reply with ONLY a JSON object, no prose and no code fences:
-    {"summary": "<2-5 plain sentences>",
+    {"headline": "<at most 12 words>",
+     "summary": "<1 sentence for low risk, up to 4 for high>",
      "risk": "low" | "medium" | "high",
      "recommendation": "approve" | "deny" | "ask",
-     "notes": ["<specific concern>", ...],
-     "not_shown": ["<thing you could not verify>", ...]}
+     "notes": ["<a concern that could change the decision>", ...],
+     "not_shown": ["<an unknown that could change the risk>", ...]}
   '';
 
   # Default reviewer command: runs as the reviewer agent, prints JSON.
@@ -253,6 +275,7 @@ ${agentCase}
           argv:$argv, exec_argv:$exec_argv,
           snapshots:[$snapshots[] | {path, sha256}],
           review:{status:$review.status, risk:$review.risk, recommendation:$review.recommendation,
+                  headline:$review.headline,
                   by:$review.by, reason:$review.reason},
           skip_review:(if $skip == "" then null else $skip end),
           decision:$decision, reason:(if $reason == "" then null else $reason end),
@@ -455,7 +478,8 @@ ${kindCase}
              (.recommendation | IN("approve", "deny", "ask")) and
              ((.notes // []) | type == "array") and
              ((.not_shown // []) | type == "array")' > /dev/null 2>&1; then
-        printf '%s' "$out" | jq '{status:"ok", summary:.summary[0:2000], risk, recommendation,
+        printf '%s' "$out" | jq '{status:"ok", headline:((.headline // "") | tostring | .[0:200]),
+          summary:.summary[0:2000], risk, recommendation,
           notes:((.notes // []) | map(tostring | .[0:500]) | .[0:20]),
           not_shown:((.not_shown // []) | map(tostring | .[0:500]) | .[0:20])}' > "$DIR/review.json.tmp" \
           && chmod 0640 "$DIR/review.json.tmp" && mv -f "$DIR/review.json.tmp" "$DIR/review.json"

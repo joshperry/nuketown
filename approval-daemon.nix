@@ -31,6 +31,8 @@ let
       + "\n\n"
       + (if $v.status == "ok" then
            "<b>Reviewer</b>: risk <b>\($v.risk | ascii_upcase)</b>, recommends <b>\($v.recommendation | ascii_upcase)</b>\n"
+           + (if (($v.headline // "") | type) == "string" and ($v.headline // "") != ""
+              then "<b>\($v.headline | cut(200) | esc)</b>\n" else "" end)
            + ($v.summary | cut(1500) | esc)
            + (if ($v.notes | length) > 0 then "\n<b>Concerns:</b>" + ($v.notes | bullets) else "" end)
            + (if ($v.not_shown | length) > 0 then "\n<b>Could not verify:</b>" + ($v.not_shown | bullets) else "" end)

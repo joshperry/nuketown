@@ -321,7 +321,7 @@ To use ephemeral agent homes:
 - **Portal into agent workspace:** `portal-ada` or `portal` (with fzf picker)
 - **View agent commits:** `git log --author=ada`
 - **Verify signatures:** `git log --verify-signatures --author=ada`
-- **Approve sudo requests:** The approval card appears automatically. Keys: Ctrl+Enter approves, Esc opens the deny reason (Enter sends it, Esc again denies without one), Ctrl+I toggles the details (ⓘ), Ctrl+C copies; keys in its first second are dropped
+- **Approve sudo requests:** The approval card appears automatically. Keys: Ctrl+Enter approves, Esc opens the deny reason (Enter sends it, even empty; Esc again denies with "aborted by the human (dismissed without a reason)"), Ctrl+I toggles the details (ⓘ), Ctrl+C copies; keys in its first second are dropped
 - **Check agent status:** `loginctl show-user ada`
 
 ### As an Agent (Claude Code)

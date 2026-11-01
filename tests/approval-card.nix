@@ -156,9 +156,9 @@ pkgs.testers.runNixOSTest {
         wait_state(n, '.deny_open and .focus == "reason" and .result == null')
         x("xdotool key Escape")
         rc, out = card_result(n, "reason-escape")
-        assert rc == 1 and out == "", (rc, out)
+        assert rc == 1 and out == "aborted by the human (dismissed without a reason)\n", (rc, out)
         rc, out = wait_bg()
-        assert rc == 1 and "Request denied." in out and "Reason:" not in out, (rc, out)
+        assert rc == 1 and "Reason: aborted by the human (dismissed without a reason)" in out, (rc, out)
 
     with subtest("deny with a reason, inside the card"):
         n0 = card_count()
@@ -212,7 +212,7 @@ pkgs.testers.runNixOSTest {
             x("xdotool key Tab")
             assert state(n)["focus"] != "approve", state(n)["focus"]
         x("xdotool key space")
-        machine.sleep(0.5)
+        machine.sleep(1)
         assert state(n)["result"] is None, state(n)
         x("xdotool key ctrl+Return")
         rc, out = card_result(n, "ctrl-enter")
@@ -274,8 +274,8 @@ pkgs.testers.runNixOSTest {
         s = wait_state(n, '.review.state == "ok"')
         assert s["texts"]["review_badge"] == "MEDIUM", s["texts"]
         assert s["texts"]["review_headline"] == "ask \u00b7 slow review", s["texts"]
-        x("xdotool key Escape Escape")
-        assert card_result(n, "reason-escape") == (1, "")
+        x("xdotool key Escape Return")      # an empty reason sent with Enter stays empty
+        assert card_result(n, "reason-enter") == (1, "")
         wait_bg()
         machine.succeed("echo ok > /tmp/reviewer-mode")
 
@@ -295,6 +295,15 @@ pkgs.testers.runNixOSTest {
         rc, out = wait_bg()
         assert rc == 0 and out.strip() == "AGE-SECRET-KEY-TEST", (rc, out)
         machine.succeed(as_ada("sops-lock"))
+
+    with subtest("closing the window denies with no reason"):
+        n0 = card_count()
+        start_bg("ada", "sudo true")
+        n = wait_card(n0)
+        x('i3-msg "[class=\\"nuketown-prompter\\"] kill"')
+        assert card_result(n, "close") == (1, "")
+        rc, out = wait_bg()
+        assert rc == 1 and "Reason:" not in out, (rc, out)
 
     with subtest("SIGTERM (a touch approved, or the requester left) denies quietly"):
         n0 = card_count()

@@ -14,8 +14,9 @@ snapshots/, kind/). The contract is the one the zenity prompter had:
 
 Deny is the default. The keyboard starts on Deny; Enter there or Esc
 anywhere on the card opens the optional reason in the card, where Enter
-denies with the reason (empty is fine) and Esc denies without one (so
-Esc Esc is a quick deny). Only a click on Approve or Ctrl+Enter
+denies with the reason (empty is fine) and Esc denies with the fixed
+reason "aborted by the human (dismissed without a reason)" (so Esc Esc
+is a quick deny). Closing the window denies with no reason. Only a click on Approve or Ctrl+Enter
 approves; Approve never takes the keyboard, so a bare Enter or Space
 can't. Ctrl+I toggles the details; Ctrl+C copies selected text. Keys in
 the card's first second are dropped, these included. review.json goes from {"status":"pending"} to the review while
@@ -50,6 +51,8 @@ POLL_MS = 300
 # password can't open the reason field and become the deny reason), and
 # Approve only takes clicks after half a second.
 KEYS_AFTER_MS, APPROVE_AFTER_MS = 1000, 500
+# Esc in the reason field: the agent learns the human stopped it on purpose.
+DISMISSED = "aborted by the human (dismissed without a reason)"
 
 # C0/C1 controls and the bidi controls that can make text read differently
 # than it runs (Trojan Source); shown as \xNN / \u{NNNN}.
@@ -372,7 +375,7 @@ class Card:
         self.reason.set_placeholder_text(f"Reason {m['requester']} sees (optional)")
         self.reason.connect("activate", lambda *_: self._deny(self.reason.get_text(), "reason-enter"))
         drow.append(self.reason)
-        drow.append(self._label("reason_hint", "Enter denies with this reason \u00b7 Esc denies without one", ("nt-dim",),
+        drow.append(self._label("reason_hint", "Enter denies with this reason \u00b7 Esc dismisses", ("nt-dim",),
                                 selectable=False))
         box.append(drow)
 
@@ -548,7 +551,7 @@ class Card:
         ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
         if keyval == Gdk.KEY_Escape and not ctrl:
             if self.deny_row.get_visible():
-                self._deny("", "reason-escape")      # Esc Esc: a quick deny
+                self._deny(DISMISSED, "reason-escape")      # Esc Esc: a quick deny
             else:
                 self._open_deny()
             return True

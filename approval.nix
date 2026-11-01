@@ -468,10 +468,12 @@ ${kindCase}
       # Every outcome records when the review started and how long it took,
       # so a slow or timed-out review can be told apart from a slow machine
       # or a slow API afterwards.
+      started() { date -u -d "@$t0" +%FT%TZ; }
+      took() { echo $(( $(date +%s) - t0 )); }
       timed() {
         local filter=$1; shift
-        write_review "$@" --arg started "$(date -u -d "@$t0" +%FT%TZ)" \
-          --argjson seconds "$(( $(date +%s) - t0 ))" "$filter + {started:\$started, seconds:\$seconds}"
+        write_review "$@" --arg started "$(started)" --argjson seconds "$(took)" \
+          "$filter + {started:\$started, seconds:\$seconds}"
       }
       out=$(timeout --kill-after=5 ${toString acfg.reviewer.timeout} \
               "$SUDO" -H -u ${lib.escapeShellArg (toString acfg.reviewer.agent)} -- ${reviewCommand} "$DIR" \
@@ -487,11 +489,12 @@ ${kindCase}
              (.recommendation | IN("approve", "deny", "ask")) and
              ((.notes // []) | type == "array") and
              ((.not_shown // []) | type == "array")' > /dev/null 2>&1; then
-        timed '$o[0] | {status:"ok", headline:((.headline // "") | tostring | .[0:200]),
+        printf '%s' "$out" | jq --arg started "$(started)" --argjson seconds "$(took)" \
+          '{status:"ok", headline:((.headline // "") | tostring | .[0:200]),
           summary:.summary[0:2000], risk, recommendation,
           notes:((.notes // []) | map(tostring | .[0:500]) | .[0:20]),
-          not_shown:((.not_shown // []) | map(tostring | .[0:500]) | .[0:20])}' \
-          --slurpfile o <(printf '%s' "$out")
+          not_shown:((.not_shown // []) | map(tostring | .[0:500]) | .[0:20])} + {started:$started, seconds:$seconds}' > "$DIR/review.json.tmp" \
+          && chmod 0640 "$DIR/review.json.tmp" && mv -f "$DIR/review.json.tmp" "$DIR/review.json"
       else
         timed '{status:"unavailable", reason:"reviewer output was not valid review JSON"}'
       fi

@@ -83,7 +83,7 @@
           To build and apply system configuration changes:
           1. `nixos-rebuild build --flake . --show-trace`
           2. `nvd diff /run/current-system result`
-          3. `sudo sh -c 'nix-env -p /nix/var/nix/profiles/system --set ./result && ./result/bin/switch-to-configuration switch'`
+          3. `nuketown-switch --why "<what changed and why>"`
           4. `unlink result`
         '';
       };

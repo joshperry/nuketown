@@ -50,15 +50,43 @@ let
     exec ${approveCmd} --cwd "$PWD" "''${args[@]}" -- "$@"
   '';
 
-  # nuketown-switch: convenience wrapper for switch-with-secrets
+  # nuketown-switch: switch the system with the sops age key decrypted
+  # first (one approval). With no command it asks to run
+  # `nuketown-apply <store path of ./result or the given system>`, the
+  # nixos-switch request kind: root attaches the system's diffs for the
+  # reviewer and the card (see switch-kind.nix).
+  # Usage: nuketown-switch [--why text] [<system>]
+  #        nuketown-switch [--why text] <command...>   (runs it instead)
   nuketownSwitch = pkgs.writeShellScriptBin "nuketown-switch" ''
-    set -e
+    set -u
+    die() { echo "nuketown-switch: $*" >&2; exit 1; }
+    why=""
+    while [ $# -gt 0 ]; do
+      case $1 in
+        --why) why=''${2-}; shift 2 ;;
+        -h|--help)
+          echo "Usage: nuketown-switch [--why text] [<system, default ./result>]" >&2
+          echo "       nuketown-switch [--why text] <command...>" >&2
+          exit 0 ;;
+        --) shift; break ;;
+        *) break ;;
+      esac
+    done
 
-    if [ $# -eq 0 ]; then
-      set -- sh -c 'nix-env -p /nix/var/nix/profiles/system --set ./result && ./result/bin/switch-to-configuration switch'
+    # No arguments, or one that is a NixOS system: the nixos-switch kind.
+    if [ $# -eq 0 ] || { [ $# -eq 1 ] && [ -e "$1/bin/switch-to-configuration" ]; }; then
+      target=''${1:-./result}
+      [ -e "$target" ] || die "$target does not exist (run nixos-rebuild build first)"
+      sys=$(readlink -f -- "$target") || die "cannot resolve $target"
+      [[ "$sys" == /nix/store/* ]] || die "$target does not resolve into /nix/store ($sys)"
+      [ -x "$sys/bin/switch-to-configuration" ] || die "$sys is not a NixOS system"
+      [ -n "$why" ] || why="switch to $(basename -- "$sys") (built in $PWD)"
+      set -- nuketown-apply "$sys"
     fi
 
-    sudoex --decrypt "/etc/sops-age-key.gpg:/run/sops-age/keys.txt" -- "$@"
+    extra=()
+    [ -n "$why" ] && extra=(--why "$why")
+    sudoex --decrypt "/etc/sops-age-key.gpg:/run/sops-age/keys.txt" "''${extra[@]}" -- "$@"
     RC=$?
     rm -f /run/sops-age/keys.txt
     echo "Age key locked." >&2
@@ -553,11 +581,14 @@ let
         `sudoex --decrypt src:dest -- command`). Used by `nuketown-switch`.
       - **`nuketown-switch`**: The standard way to apply NixOS configuration
         changes. It decrypts the sops age key through the approval system,
-        then switches the system. Run it with no arguments after building:
+        then switches to the built system (`./result`, or a system path you
+        pass) with `nuketown-apply`. Root attaches the package, sudoers,
+        users, wrappers, firewall and unit diffs to the request, so say what
+        the change is for:
         ```
         nixos-rebuild build --flake . --show-trace
         nvd diff /run/current-system result
-        nuketown-switch
+        nuketown-switch --why "<what changed and why>"
         unlink result
         ```
         Do NOT use raw `sudo` for system switches — always use `nuketown-switch`.
@@ -796,7 +827,7 @@ in
     };
   };
 
-  imports = [ ./approval.nix ];
+  imports = [ ./approval.nix ./switch-kind.nix ];
 
   config = lib.mkIf cfg.enable ({
 

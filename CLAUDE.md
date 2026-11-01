@@ -54,6 +54,7 @@ Agent home directories live on a btrfs subvolume (`@agents`) that rolls back to 
 nuketown/
 ├── module.nix            # Main NixOS module (~770 lines)
 ├── approval.nix          # nuketown-approval service user (sudo requests, snapshots, reviewer, audit)
+├── switch-kind.nix       # built-in nixos-switch kind: nuketown-apply, its collector and review prompt
 ├── approval-daemon.nix   # Home-manager module for sudo approval daemon
 ├── prompter/             # nuketown-prompter: the approval card (Python + GTK 4, X11/Wayland)
 ├── checks.nix            # Pure nix evaluation checks (nix flake check)
@@ -69,6 +70,7 @@ nuketown/
 │   ├── sudo-approval-bypass.nix  # VM check: no path to root without approval
 │   ├── approval-flow.nix      # VM check: snapshots, reviewer, kinds, requester, audit
 │   ├── approval-decrypt.nix   # VM check: PIN prompt after Approve, touch-only approval
+│   ├── approval-switch-kind.nix  # VM check: nixos-switch kind (collector, refusals, real switch)
 │   └── approval-card.nix      # VM check: the card on X11/i3 and Wayland (xdotool, screenshots)
 ├── README.md             # User-facing documentation
 ├── CLAUDE.md             # This file - developer guidance
@@ -152,6 +154,17 @@ When `sudo.enable = true` for an agent:
    line is shown as "No review: <reason>" and recorded as `skip_review`. Only
    the collector (root, in the service user's `kind/`) can write it. Root may pass `--requester <name>`
    (human or timer requests; the human's own requests skip the review).
+   One kind is built in (`switch-kind.nix`): **`nixos-switch`** for
+   `nuketown-apply <system store path>`, which `nuketown-switch` requests
+   (with the sops age key decrypted first). `nuketown-apply` only accepts
+   the canonical store path of a NixOS toplevel; it sets the system profile
+   and runs `switch-to-configuration switch`. Its collector (root) refuses
+   anything else, then writes `kind/system.txt`, `nvd-diff.txt`,
+   `sudoers.diff` (sudoers, polkit), `access.diff` (users/groups, setuid
+   wrappers, firewall, sshd, authorized keys), `activate.diff`, `units.diff`
+   (store hashes normalised) and `git.txt` (the request cwd's HEAD and
+   dirty state, read as the requester, never root). Every field of
+   `nuketown.approval.kinds.nixos-switch` is `mkDefault`.
 3. It sends `REQUEST:<id>` to the human's broker (approval-daemon.nix), the only
    other member of the broker socket's group. The broker shows the request
    (the built-in card, `prompter/`, or `nuketown.approvalDaemon.prompter`) and answers
@@ -235,7 +248,7 @@ nuketown.agents.ada = {
       ## NixOS Workflow
       1. `nixos-rebuild build --flake . --show-trace`
       2. `nvd diff /run/current-system result`
-      3. `sudo sh -c 'nix-env -p /nix/var/nix/profiles/system --set ./result && ./result/bin/switch-to-configuration switch'`
+      3. `nuketown-switch --why "<what changed and why>"`
     '';
   };
 };
@@ -342,8 +355,9 @@ nixos-rebuild build --flake . --show-trace
 # 3. Review changes
 nvd diff /run/current-system result
 
-# 4. Request approval to switch (triggers zenity dialog)
-sudo sh -c 'nix-env -p /nix/var/nix/profiles/system --set ./result && ./result/bin/switch-to-configuration switch'
+# 4. Request approval to switch (one card: decrypt the sops age key, then
+#    nuketown-apply <store path of ./result>; kind nixos-switch)
+nuketown-switch --why "<what changed and why>"
 
 # 5. Cleanup
 unlink result

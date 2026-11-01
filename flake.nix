@@ -563,6 +563,11 @@
             inherit nixpkgs-unstable home-manager impermanence sops-nix;
             nuketownModule = ./module.nix;
           };
+          vm-approval-switch-kind = import ./tests/approval-switch-kind.nix {
+            pkgs = pkgsFor system;
+            inherit nixpkgs-unstable home-manager impermanence sops-nix;
+            nuketownModule = ./module.nix;
+          };
           vm-approval-card = import ./tests/approval-card.nix {
             pkgs = pkgsFor system;
             inherit nixpkgs-unstable home-manager impermanence sops-nix;

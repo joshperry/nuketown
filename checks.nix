@@ -447,6 +447,78 @@ in {
       (builtins.elem "sudo-with-approval" sysPkgNames) false)
   ]);
 
+  # ── Built-in nixos-switch kind ─────────────────────────────────
+
+  module-nixos-switch-kind = mkCheck "module-nixos-switch-kind" (let
+    k = fullCfg.nuketown.approval.kinds;
+    sysPkgNames = map (p: p.name) fullCfg.environment.systemPackages;
+    overridden = (evalConfig fullAgentConfig [{
+      nuketown.approval.kinds.nixos-switch = { timeout = 5; reviewPrompt = null; };
+    }]).nuketown.approval.kinds.nixos-switch;
+  in [
+    (assertEq "nixos-switch kind defined by default" (k ? nixos-switch) true)
+    (assertEq "kind command is nuketown-apply as PATH resolves it"
+      k.nixos-switch.command "/run/current-system/sw/bin/nuketown-apply")
+    (assertContains "kind collector" k.nixos-switch.collect "nuketown-nixos-switch-collect")
+    (assertContains "kind prompt" k.nixos-switch.reviewPrompt "nuketown-nixos-switch-prompt.md")
+    (assertEq "nuketown-apply in system packages" (builtins.elem "nuketown-apply" sysPkgNames) true)
+    (assertEq "fields override" [ overridden.timeout overridden.reviewPrompt ] [ 5 null ])
+    (assertEq "override keeps the other defaults"
+      overridden.command "/run/current-system/sw/bin/nuketown-apply")
+    (assertEq "no kind without approvals" (customCfg.nuketown.approval.kinds ? nixos-switch) false)
+    (assertEq "no nuketown-apply without approvals"
+      (builtins.elem "nuketown-apply" (map (p: p.name) customCfg.environment.systemPackages)) false)
+  ]);
+
+  # nuketown-switch, nuketown-apply and the collector build and parse, and
+  # nuketown-switch asks for nuketown-apply <store path> (a fake sudoex
+  # records what it was asked) or passes a custom command through.
+  module-nuketown-switch = let
+    sw = builtins.head (builtins.filter (p: p.name == "nuketown-switch") adaHM.home.packages);
+    applyPkg = fullCfg.nuketown.approval.nixosSwitch.package;
+    collector = fullCfg.nuketown.approval.nixosSwitch.collector;
+    fakeSystem = pkgs.runCommand "nixos-system-fake" {} ''
+      mkdir -p $out/bin
+      printf '#!/bin/sh\n' > $out/bin/switch-to-configuration
+      chmod +x $out/bin/switch-to-configuration
+      echo 26.05 > $out/nixos-version
+    '';
+  in pkgs.runCommand "nuketown-check-module-nuketown-switch" {} ''
+    set -euo pipefail
+    for f in ${sw}/bin/nuketown-switch ${applyPkg}/bin/nuketown-apply ${collector}; do
+      ${pkgs.bash}/bin/bash -n "$f"
+    done
+    mkdir -p bin work
+    cat > bin/sudoex <<'EOF'
+    #!${pkgs.bash}/bin/bash
+    printf '%s\n' "$@" > "$OUT_ARGS"
+    EOF
+    chmod +x bin/sudoex
+    export PATH=$PWD/bin:$PATH
+    cd work
+    ln -s ${fakeSystem} result
+
+    OUT_ARGS=$PWD/a1 ${sw}/bin/nuketown-switch
+    printf '%s\n' --decrypt /etc/sops-age-key.gpg:/run/sops-age/keys.txt \
+      --why "switch to $(basename ${fakeSystem}) (built in $PWD)" -- nuketown-apply ${fakeSystem} > want1
+    diff -u want1 a1
+
+    OUT_ARGS=$PWD/a2 ${sw}/bin/nuketown-switch --why "add hello" result
+    printf '%s\n' --decrypt /etc/sops-age-key.gpg:/run/sops-age/keys.txt \
+      --why "add hello" -- nuketown-apply ${fakeSystem} > want2
+    diff -u want2 a2
+
+    OUT_ARGS=$PWD/a3 ${sw}/bin/nuketown-switch sh -c 'echo custom'
+    printf '%s\n' --decrypt /etc/sops-age-key.gpg:/run/sops-age/keys.txt -- sh -c 'echo custom' > want3
+    diff -u want3 a3
+
+    rm result
+    if OUT_ARGS=$PWD/a4 ${sw}/bin/nuketown-switch 2> err; then echo "no ./result accepted" >&2; exit 1; fi
+    grep -q 'does not exist' err
+    echo "PASS: module-nuketown-switch"
+    mkdir -p $out && echo ok > $out/result
+  '';
+
   # ── Claude Code Integration Checks ─────────────────────────────
 
   claude-code-enabled = mkCheck "claude-code-enabled" [

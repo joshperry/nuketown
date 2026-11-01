@@ -54,7 +54,7 @@ pkgs.testers.runNixOSTest {
     services.displayManager.defaultSession = "none+i3";
     services.xserver.windowManager.i3 = { enable = true; configFile = i3Config; };
     fonts.packages = [ pkgs.dejavu_fonts ];
-    environment.systemPackages = [ pkgs.xdotool pkgs.i3 quickCmd ];
+    environment.systemPackages = [ pkgs.xdotool pkgs.xclip pkgs.i3 quickCmd ];
     nuketown.approval.kinds.quick = { command = "/run/current-system/sw/bin/quick-cmd"; inherit timeout; };
     virtualisation.memorySize = 2048;
   };
@@ -130,7 +130,7 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds("su - human -c 'DISPLAY=:0 i3-msg -t get_version'", timeout=60)
     machine.succeed(as_ada("printf '#!/bin/sh\\nfor d in $(ls -td /var/lib/nuketown-approval/*/ | head -2); do\\n  ls \"$d\"\\n  cat \"$d/review.json\"\\ndone\\n' > ~/check.sh"))
 
-    with subtest("fresh card: the keyboard is on Deny; Enter and Escape never approve"):
+    with subtest("fresh card: the keyboard is on Deny; Enter and Esc never approve; Esc Esc denies"):
         machine.succeed("echo ok > /tmp/reviewer-mode")
         n0 = card_count()
         start_bg("ada", "sudo --why 'check the clock' date")
@@ -138,7 +138,7 @@ pkgs.testers.runNixOSTest {
         # Typing that was meant for another window doesn't reach the card
         # in its first second (no reason field, no decision): the keys go
         # out within ~0.1 s of the card's first state dump.
-        x(f"sh -c \"until jq -e .bounds.deny /tmp/cards/{n}/state.json >/dev/null 2>&1; do sleep 0.05; done; xdotool key space x Return\"")
+        x(f"sh -c \"until jq -e .bounds.deny /tmp/cards/{n}/state.json >/dev/null 2>&1; do sleep 0.05; done; xdotool key space x ctrl+Return Escape Return\"")
         s = wait_state(n, '.armed and .dropped_keys >= 1')
         assert not s["deny_open"] and s["result"] is None and s["reason_text"] == "", s
         s = wait_state(n, '.review.state == "ok" and .focus == "deny"')
@@ -151,12 +151,11 @@ pkgs.testers.runNixOSTest {
         win = i3_card()
         assert win and win["floating"] in ("auto_on", "user_on"), win
         assert win["window_properties"]["class"] == "nuketown-prompter", win
+        assert s["tooltips"] == {"deny": "Deny (Esc)", "approve": "Approve (Ctrl+Enter)", "info": "Details (Ctrl+I)"}, s["tooltips"]
         x("xdotool key Return")
         wait_state(n, '.deny_open and .focus == "reason" and .result == null')
         x("xdotool key Escape")
-        wait_state(n, '(.deny_open | not) and .focus == "deny" and .result == null')
-        x("xdotool key Escape")
-        rc, out = card_result(n, "escape")
+        rc, out = card_result(n, "reason-escape")
         assert rc == 1 and out == "", (rc, out)
         rc, out = wait_bg()
         assert rc == 1 and "Request denied." in out and "Reason:" not in out, (rc, out)
@@ -166,8 +165,8 @@ pkgs.testers.runNixOSTest {
         start_bg("ada", "sudo --why 'tidy up' rm -rf /var/tmp/scratch")
         n = wait_card(n0)
         wait_state(n, '.review.state == "ok" and .focus == "deny"')
-        x("xdotool key Return")
-        wait_state(n, '.focus == "reason"')
+        x("xdotool key Escape")      # Esc on the card opens the reason
+        wait_state(n, '.deny_open and .focus == "reason" and .result == null')
         x('xdotool type --delay 20 "too risky today"')
         wait_state(n, '.reason_text == "too risky today"')
         machine.screenshot("card-deny-reason")
@@ -201,6 +200,26 @@ pkgs.testers.runNixOSTest {
         rc, out = wait_bg()
         assert rc == 0 and out.strip() == "root", (rc, out)
 
+    with subtest("keys: Ctrl+I toggles details; Tab and Space never reach Approve; Ctrl+Enter approves"):
+        n0 = card_count()
+        start_bg("ada", "sudo id -un")
+        n = wait_card(n0)
+        x("xdotool key ctrl+i")
+        wait_state(n, '.details_open')
+        x("xdotool key ctrl+i")
+        wait_state(n, '.details_open | not')
+        for _ in range(8):
+            x("xdotool key Tab")
+            assert state(n)["focus"] != "approve", state(n)["focus"]
+        x("xdotool key space")
+        machine.sleep(0.5)
+        assert state(n)["result"] is None, state(n)
+        x("xdotool key ctrl+Return")
+        rc, out = card_result(n, "ctrl-enter")
+        assert rc == 0 and out == "", (rc, out)
+        rc, out = wait_bg()
+        assert rc == 0 and out.strip() == "root", (rc, out)
+
     with subtest("the review lands in the open card, in place; agent and reviewer text stay plain"):
         machine.succeed("echo card > /tmp/reviewer-mode")
         n0 = card_count()
@@ -214,6 +233,10 @@ pkgs.testers.runNixOSTest {
         click(n, "why", "click --repeat 2 1")
         s = wait_state(n, '.selections.why')
         sel, pid, xid = s["selections"]["why"], s["pid"], s["xid"]
+        # Ctrl+C copies it.
+        x("xdotool key ctrl+c")
+        copied = x("xclip -o -selection clipboard")
+        assert copied and copied in s["texts"]["why"], copied
         s = wait_state(n, '.review.state == "ok" and .review_updates == 1')
         assert (s["pid"], s["xid"]) == (pid, xid), "the card was replaced, not updated"
         assert s["selections"].get("why") == sel, ("selection lost", s["selections"])
@@ -251,8 +274,8 @@ pkgs.testers.runNixOSTest {
         s = wait_state(n, '.review.state == "ok"')
         assert s["texts"]["review_badge"] == "MEDIUM", s["texts"]
         assert s["texts"]["review_headline"] == "ask \u00b7 slow review", s["texts"]
-        x("xdotool key Escape")
-        assert card_result(n) == (1, "")
+        x("xdotool key Escape Escape")
+        assert card_result(n, "reason-escape") == (1, "")
         wait_bg()
         machine.succeed("echo ok > /tmp/reviewer-mode")
 

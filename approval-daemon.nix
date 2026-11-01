@@ -48,7 +48,8 @@ let
   # Default prompter: the approval card (prompter/, GTK 4 on X11 or
   # Wayland). It keeps zenity's contract: exit 0 = approve; on deny the
   # first line of stdout is the reason (may be empty); "no answer within
-  # Ns" on timeout; SIGTERM denies. Deny has the keyboard, and the card
+  # Ns" on timeout; SIGTERM denies. Deny has the keyboard (Esc opens the
+  # reason, Esc again denies; only a click or Ctrl+Enter approves), and the card
   # updates in place when review.json lands. NUKETOWN_PROMPT_NOTE (from
   # the broker) is shown on the card.
   cardPrompter = pkgs.callPackage ./prompter { };

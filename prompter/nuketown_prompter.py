@@ -12,10 +12,13 @@ snapshots/, kind/). The contract is the one the zenity prompter had:
   SIGTERM/INT/HUP    exit 1 (the broker approved by a YubiKey touch, or
                      the requester went away)
 
-Deny is the default: the keyboard starts on Deny, Enter there opens the
-optional reason (Enter sends, Escape goes back) and Escape on the card
-denies. Nothing but a click on Approve, or moving to it on purpose,
-approves. review.json goes from {"status":"pending"} to the review while
+Deny is the default. The keyboard starts on Deny; Enter there or Esc
+anywhere on the card opens the optional reason in the card, where Enter
+denies with the reason (empty is fine) and Esc denies without one (so
+Esc Esc is a quick deny). Only a click on Approve or Ctrl+Enter
+approves; Approve never takes the keyboard, so a bare Enter or Space
+can't. Ctrl+I toggles the details; Ctrl+C copies selected text. Keys in
+the card's first second are dropped, these included. review.json goes from {"status":"pending"} to the review while
 the card is up; the card updates in place.
 
 Everything the agent or the reviewer wrote is shown as plain text (never
@@ -342,7 +345,7 @@ class Card:
         i.set_xalign(0.5)
         i.set_halign(self.Gtk.Align.CENTER)
         self.info.set_child(i)
-        self.info.set_tooltip_text("Details")
+        self.info.set_tooltip_text("Details (Ctrl+I)")
         self.info.set_focus_on_click(False)     # the keyboard stays on Deny
         self.info.add_css_class("circular")
         self.info.add_css_class("flat")
@@ -369,7 +372,7 @@ class Card:
         self.reason.set_placeholder_text(f"Reason {m['requester']} sees (optional)")
         self.reason.connect("activate", lambda *_: self._deny(self.reason.get_text(), "reason-enter"))
         drow.append(self.reason)
-        drow.append(self._label("reason_hint", "Enter denies with this reason \u00b7 Escape goes back", ("nt-dim",),
+        drow.append(self._label("reason_hint", "Enter denies with this reason \u00b7 Esc denies without one", ("nt-dim",),
                                 selectable=False))
         box.append(drow)
 
@@ -381,9 +384,13 @@ class Card:
         actions.append(self.remaining)
         self.deny_btn = Gtk.Button(label="Deny")
         self.deny_btn.connect("clicked", self._on_deny)
+        self.deny_btn.set_tooltip_text("Deny (Esc)")
         self.approve_btn = Gtk.Button(label="Approve")
         self.approve_btn.set_sensitive(False)
         self.approve_btn.connect("clicked", lambda *_: self._finish(0, None, "approve"))
+        self.approve_btn.set_tooltip_text("Approve (Ctrl+Enter)")
+        # Never the keyboard's: Tab skips it, so bare Enter/Space can't approve.
+        self.approve_btn.set_focusable(False)
         actions.append(self.deny_btn)
         actions.append(self.approve_btn)
         box.append(actions)
@@ -532,19 +539,27 @@ class Card:
         self._dump()
         return False
 
-    def _on_key(self, _ctl, keyval, _code, _state):
+    def _on_key(self, _ctl, keyval, _code, state):
         Gdk = self.Gdk
         if not self.keys_armed:
             self.dropped_keys += 1
             self._dump()
             return True
-        if keyval == Gdk.KEY_Escape:
+        ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        if keyval == Gdk.KEY_Escape and not ctrl:
             if self.deny_row.get_visible():
-                self._close_deny()
+                self._deny("", "reason-escape")      # Esc Esc: a quick deny
             else:
-                self._deny("", "escape")
+                self._open_deny()
             return True
-        return False
+        if ctrl and keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_ISO_Enter):
+            if self.approve_btn.get_sensitive():
+                self._finish(0, None, "ctrl-enter")
+            return True
+        if ctrl and keyval in (Gdk.KEY_i, Gdk.KEY_I):
+            self.info.set_active(not self.info.get_active())
+            return True
+        return False     # Ctrl+C and the rest: the focused widget's
 
     def _on_info(self, btn):
         if btn.get_active():
@@ -573,14 +588,11 @@ class Card:
         if self.deny_row.get_visible():
             self._deny(self.reason.get_text(), "deny-button")
             return
+        self._open_deny()
+
+    def _open_deny(self):
         self.deny_row.set_visible(True)
         self.reason.grab_focus()
-        self._dump()
-
-    def _close_deny(self):
-        self.deny_row.set_visible(False)
-        self.reason.set_text("")
-        self.deny_btn.grab_focus()
         self._dump()
 
     def _deny(self, reason, cause):
@@ -641,6 +653,8 @@ class Card:
             "cause": self.cause,
             "armed": self.keys_armed and self.approve_btn.get_sensitive(),
             "dropped_keys": self.dropped_keys,
+            "tooltips": {k: w.get_tooltip_text() for k, w in
+                         (("deny", self.deny_btn), ("approve", self.approve_btn), ("info", self.info))},
         }
         tmp = self.state_file + ".tmp"
         with open(tmp, "w") as f:

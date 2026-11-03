@@ -687,7 +687,7 @@ Status: not started.
 - `flake.nix`: Flake with test VMs, dev shell, apps, checks
 - `example.nix`: Example configuration with two agents
 - `docs/cloud-spec.md`: Cloud deployment spec and design
-- `docs/signer-daemon.md`: Signer daemon design — dual-use vault for nuketown agents (Unix socket) and Seed microvms (vsock); supersedes swtpm and sops-resident operational keys
+- `docs/agent-keys.md`: Agent key custody and unlock — stock gpg-agent under a separate `<agent>-keys` uid, unlock through a `key-unlock` approval kind, per-key TTLs, screen-lock wipes, journald oplog (replaces the per-operation signer-daemon design)
 
 **mynix (production consumer):**
 mynix imports `nuketown.nixosModules.default` for production agent management on signi.
